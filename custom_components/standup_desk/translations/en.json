@@ -1,0 +1,36 @@
+{
+    "config": {
+        "step": {
+            "user": {
+                "title": "Set up Stand Up Pls Desk",
+                "description": "The desk will be discovered automatically. Make sure Bluetooth is enabled.",
+                "data": {
+                    "device_name": "Device name (starts with 'stand UP-')"
+                }
+            },
+            "bluetooth_confirm": {
+                "title": "Confirm desk",
+                "description": "Found desk: {name}"
+            }
+        },
+        "error": {
+            "cannot_connect": "Connection failed — is the desk powered on?",
+            "not_found": "Desk not found — is Bluetooth enabled?",
+            "unknown": "Unknown error"
+        },
+        "abort": {
+            "already_configured": "This desk is already configured"
+        }
+    },
+    "options": {
+        "step": {
+            "init": {
+                "title": "Desk height presets",
+                "data": {
+                    "sit_height": "Sitting height (cm)",
+                    "stand_height": "Standing height (cm)"
+                }
+            }
+        }
+    }
+}

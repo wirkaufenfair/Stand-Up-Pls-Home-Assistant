@@ -1,0 +1,36 @@
+{
+    "config": {
+        "step": {
+            "user": {
+                "title": "Stand Up Pls Schreibtisch einrichten",
+                "description": "Der Schreibtisch wird automatisch erkannt. Stelle sicher, dass Bluetooth aktiviert ist.",
+                "data": {
+                    "device_name": "Gerätename (beginnt mit 'stand UP-')"
+                }
+            },
+            "bluetooth_confirm": {
+                "title": "Schreibtisch bestätigen",
+                "description": "Schreibtisch gefunden: {name}"
+            }
+        },
+        "error": {
+            "cannot_connect": "Verbindung fehlgeschlagen — ist der Schreibtisch eingeschaltet?",
+            "not_found": "Schreibtisch nicht gefunden — ist Bluetooth aktiviert?",
+            "unknown": "Unbekannter Fehler"
+        },
+        "abort": {
+            "already_configured": "Dieser Schreibtisch ist bereits konfiguriert"
+        }
+    },
+    "options": {
+        "step": {
+            "init": {
+                "title": "Höhen-Voreinstellungen",
+                "data": {
+                    "sit_height": "Sitzhöhe (cm)",
+                    "stand_height": "Stehhöhe (cm)"
+                }
+            }
+        }
+    }
+}

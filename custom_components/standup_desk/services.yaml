@@ -1,0 +1,37 @@
+control:
+  name: Control desk
+  description: Move the desk up, down, or stop.
+  fields:
+    action:
+      name: Action
+      description: "Movement direction: up, down, or stop"
+      required: true
+      selector:
+        select:
+          options:
+            - "up"
+            - "down"
+            - "stop"
+    target_height:
+      name: Target height
+      description: "Optional target height in cm (overrides preset)"
+      required: false
+      selector:
+        number:
+          min: 65
+          max: 130
+          unit_of_measurement: cm
+
+move_to:
+  name: Move to height
+  description: Move the desk to a specific height in cm.
+  fields:
+    height:
+      name: Height
+      description: "Target height in cm"
+      required: true
+      selector:
+        number:
+          min: 65
+          max: 130
+          unit_of_measurement: cm
