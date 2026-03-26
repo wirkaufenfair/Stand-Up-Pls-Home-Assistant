@@ -1,21 +1,21 @@
 {
     "domain": "standup_desk",
     "name": "Stand Up Pls Desk",
+    "bluetooth": [
+        {
+            "connectable": true,
+            "service_uuid": "6e400001-b5a3-f393-e0a9-e50e24dcca9e"
+        }
+    ],
     "codeowners": ["@wirkaufenfair"],
     "config_flow": true,
+    "dependencies": ["bluetooth_adapters"],
     "documentation": "https://github.com/wirkaufenfair/Stand-Up-Pls-Home-Assistant",
-    "issue_tracker": "https://github.com/wirkaufenfair/Stand-Up-Pls-Home-Assistant/issues",
     "iot_class": "local_push",
+    "issue_tracker": "https://github.com/wirkaufenfair/Stand-Up-Pls-Home-Assistant/issues",
     "requirements": [
         "bleak>=0.21.0",
         "bleak-retry-connector>=3.6.0"
     ],
-    "version": "1.0.0",
-    "bluetooth": [
-        {
-            "service_uuid": "6e400001-b5a3-f393-e0a9-e50e24dcca9e",
-            "connectable": true
-        }
-    ],
-    "dependencies": ["bluetooth_adapters"]
+    "version": "1.0.0"
 }
