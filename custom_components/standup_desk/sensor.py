@@ -14,6 +14,7 @@ from homeassistant.const import UnitOfLength
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.restore_state import RestoreEntity
 
 from .const import DOMAIN, MANUFACTURER, MODEL
 from . import StandUpDeskConnection
@@ -36,7 +37,7 @@ async def async_setup_entry(
     ])
 
 
-class StandUpDeskHeightSensor(SensorEntity):
+class StandUpDeskHeightSensor(SensorEntity, RestoreEntity):
     """Current desk height in cm."""
 
     _attr_device_class = SensorDeviceClass.DISTANCE
@@ -57,6 +58,22 @@ class StandUpDeskHeightSensor(SensorEntity):
             model=MODEL,
         )
         self._connection.register_callback(self._handle_status_update)
+
+    async def async_added_to_hass(self) -> None:
+        """Restore last known height if no fresh status is available yet."""
+        await super().async_added_to_hass()
+
+        if self._attr_native_value is not None:
+            return
+
+        last_state = await self.async_get_last_state()
+        if last_state is None or last_state.state in ("unknown", "unavailable"):
+            return
+
+        try:
+            self._attr_native_value = float(last_state.state)
+        except (ValueError, TypeError):
+            _LOGGER.debug("Cannot restore previous height state: %s", last_state.state)
 
     async def async_will_remove_from_hass(self) -> None:
         self._connection.unregister_callback(self._handle_status_update)
