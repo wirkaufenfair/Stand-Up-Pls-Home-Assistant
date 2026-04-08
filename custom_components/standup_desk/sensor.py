@@ -49,7 +49,7 @@ class StandUpDeskHeightSensor(SensorEntity):
         self._connection = connection
         self._attr_unique_id = f"{entry_id}_height"
         self._attr_name = "Height"
-        self._attr_native_value = None
+        self._attr_native_value = connection.current_status.get("height_cm")
         self._attr_device_info = DeviceInfo(
             identifiers={(DOMAIN, mac)},
             name=device_name,
@@ -87,7 +87,11 @@ class StandUpDeskMovingSensor(SensorEntity):
         self._connection = connection
         self._attr_unique_id = f"{entry_id}_moving"
         self._attr_name = "Movement"
-        self._attr_native_value = "idle"
+        status = connection.current_status
+        if status.get("is_moving"):
+            self._attr_native_value = status.get("direction", "idle")
+        else:
+            self._attr_native_value = "idle"
         self._attr_device_info = DeviceInfo(
             identifiers={(DOMAIN, mac)},
             name=device_name,

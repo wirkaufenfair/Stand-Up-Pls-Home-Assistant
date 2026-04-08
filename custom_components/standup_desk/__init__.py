@@ -104,6 +104,13 @@ class StandUpDeskConnection:
                 self._on_disconnected,
             )
             await self.client.start_notify(TX_CHAR_UUID, self._notification_handler)
+
+            # Ask desk for a fresh status packet right after subscribing.
+            try:
+                await self.request_status()
+            except Exception as error:
+                _LOGGER.debug("Initial status request failed: %s", error)
+
             self.is_connected = True
             _LOGGER.info("Connected to desk")
             return True
@@ -146,6 +153,16 @@ class StandUpDeskConnection:
     def unregister_callback(self, callback) -> None:
         if callback in self._callbacks:
             self._callbacks.remove(callback)
+
+    async def request_status(self) -> None:
+        """Request a fresh status packet from desk.
+
+        The desk typically responds to a STOP frame with a notification containing
+        current height/direction, which lets sensors avoid an initial 'unknown'.
+        """
+        if not self.client:
+            return
+        await self.client.write_gatt_char(RX_CHAR_UUID, STOP_COMMAND, response=False)
 
     async def move_to_height(self, target_cm: float, direction: str) -> None:
         """Move desk to target height. Direction must be 'up' or 'down'."""
