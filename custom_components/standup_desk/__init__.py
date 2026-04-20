@@ -10,7 +10,11 @@ import logging
 from typing import Any
 
 from bleak import BleakClient
-from bleak_retry_connector import establish_connection, BleakClientWithServiceCache
+from bleak.exc import BleakError
+from bleak_retry_connector import (
+    BleakClientWithServiceCache,
+    establish_connection,
+)
 from homeassistant.components.bluetooth import async_ble_device_from_address
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import Platform
@@ -27,6 +31,7 @@ from .const import (
     DOWN_COMMAND,
     MANUFACTURER,
     MAX_MOVEMENT_STEPS,
+    MAX_STALL_STEPS,
     MODEL,
     MOVEMENT_INTERVAL,
     RX_CHAR_UUID,
@@ -37,6 +42,8 @@ from .const import (
 )
 
 _LOGGER = logging.getLogger(__name__)
+
+BLE_EXCEPTIONS = (BleakError, asyncio.TimeoutError, OSError)
 
 PLATFORMS = [Platform.SENSOR, Platform.NUMBER, Platform.BUTTON]
 
@@ -91,56 +98,75 @@ class StandUpDeskConnection:
         self.stand_height: int = DEFAULT_STAND_HEIGHT
         self._callbacks: list = []
         self._stop_requested = False
+        self._move_lock = asyncio.Lock()
 
     async def connect(self) -> bool:
+        """Open the BLE connection and subscribe to desk updates."""
         try:
             _LOGGER.info("Connecting to desk: %s", self.mac_address)
             ble_device = async_ble_device_from_address(
-                self.hass, self.mac_address, connectable=True
+                self.hass,
+                self.mac_address,
+                connectable=True,
             )
+            if ble_device is None:
+                _LOGGER.error("BLE device not found: %s", self.mac_address)
+                self.is_connected = False
+                return False
+
             self.client = await establish_connection(
                 BleakClientWithServiceCache,
-                ble_device or self.mac_address,
+                ble_device,
+                self.mac_address,
                 self._on_disconnected,
             )
-            await self.client.start_notify(TX_CHAR_UUID, self._notification_handler)
+            await self.client.start_notify(
+                TX_CHAR_UUID,
+                self._notification_handler,
+            )
 
             # Ask desk for a fresh status packet right after subscribing.
             try:
                 await self.request_status()
-            except Exception as error:
+            except BLE_EXCEPTIONS as error:
                 _LOGGER.debug("Initial status request failed: %s", error)
 
             self.is_connected = True
             _LOGGER.info("Connected to desk")
             return True
-        except Exception as error:
+        except BLE_EXCEPTIONS as error:
             _LOGGER.error("Connection error: %s", error)
             self.is_connected = False
             return False
 
     async def disconnect(self) -> None:
+        """Close the BLE connection and stop desk notifications."""
         if self.client and self.is_connected:
             try:
-                if self.client.services is None:
-                    await self.client.get_services()
                 await self.client.stop_notify(TX_CHAR_UUID)
                 await self.client.disconnect()
-            except Exception as error:
+            except BLE_EXCEPTIONS as error:
                 _LOGGER.debug("Disconnect error: %s", error)
             finally:
                 self.is_connected = False
 
     async def ensure_connected(self) -> bool:
+        """Return whether the desk is connected, reconnecting if needed."""
         if self.is_connected:
             return True
         return await self.connect()
 
     def _on_disconnected(self, _client: BleakClient) -> None:
+        """Handle an unexpected BLE disconnect callback."""
         _LOGGER.warning("BLE disconnected: %s", self.mac_address)
         self.is_connected = False
 
-    def _notification_handler(self, _characteristic: Any, data: bytearray) -> None:
+    def _notification_handler(
+        self,
+        _characteristic: Any,
+        data: bytearray,
+    ) -> None:
+        """Process incoming BLE notifications from the desk."""
         status = decode_desk_status(data)
         if status:
             self.current_status = status
@@ -148,68 +174,155 @@ class StandUpDeskConnection:
                 self.hass.async_create_task(callback(status))
 
     def register_callback(self, callback) -> None:
+        """Register a coroutine callback for status updates."""
         self._callbacks.append(callback)
 
     def unregister_callback(self, callback) -> None:
+        """Remove a previously registered status callback."""
         if callback in self._callbacks:
             self._callbacks.remove(callback)
 
     async def request_status(self) -> None:
         """Request a fresh status packet from desk.
 
-        The desk typically responds to a STOP frame with a notification containing
-        current height/direction, which lets sensors avoid an initial 'unknown'.
+        The desk typically responds to a STOP frame with a notification
+        containing current height/direction, which lets sensors avoid an
+        initial 'unknown'.
         """
         if not self.client:
             return
-        await self.client.write_gatt_char(RX_CHAR_UUID, STOP_COMMAND, response=False)
+        await self.client.write_gatt_char(
+            RX_CHAR_UUID,
+            STOP_COMMAND,
+            response=False,
+        )
 
     async def move_to_height(self, target_cm: float, direction: str) -> None:
         """Move desk to target height. Direction must be 'up' or 'down'."""
-        if not await self.ensure_connected():
-            _LOGGER.error("Cannot move: not connected")
-            return
+        async with self._move_lock:
+            if direction not in {"up", "down"}:
+                _LOGGER.error("Cannot move: invalid direction %s", direction)
+                return
 
-        cmd = UP_COMMAND if direction == "up" else DOWN_COMMAND
-
-        # Init ping
-        await self.client.write_gatt_char(RX_CHAR_UUID, STOP_COMMAND, response=False)
-        await asyncio.sleep(0.3)
-
-        self._stop_requested = False
-        start_cm = self.current_status.get("height_cm", 0)
-        _LOGGER.info("Moving %s: %.0f cm -> %.0f cm", direction, start_cm, target_cm)
-
-        target_reached = False
-        for step in range(MAX_MOVEMENT_STEPS):
-            if self._stop_requested:
-                _LOGGER.info("Stop requested at %.0f cm", self.current_status.get("height_cm", 0))
-                break
+            if not await self.ensure_connected() or not self.client:
+                _LOGGER.error("Cannot move: not connected")
+                return
 
             current_cm = self.current_status.get("height_cm", 0)
             if direction == "up" and current_cm >= target_cm - TOLERANCE_CM:
-                target_reached = True
-                break
+                _LOGGER.info(
+                    "Desk already at or above target: %.0f cm",
+                    current_cm,
+                )
+                return
             if direction == "down" and current_cm <= target_cm + TOLERANCE_CM:
-                target_reached = True
-                break
+                _LOGGER.info(
+                    "Desk already at or below target: %.0f cm",
+                    current_cm,
+                )
+                return
 
-            await self.client.write_gatt_char(RX_CHAR_UUID, cmd, response=False)
-            await asyncio.sleep(MOVEMENT_INTERVAL)
+            cmd = UP_COMMAND if direction == "up" else DOWN_COMMAND
 
-        # Send stop
-        await self.client.write_gatt_char(RX_CHAR_UUID, STOP_COMMAND, response=False)
-        final_cm = self.current_status.get("height_cm", 0)
-        if target_reached:
-            _LOGGER.info("Target reached at %.0f cm", final_cm)
-        else:
-            _LOGGER.warning("Movement timeout at %.0f cm (target: %.0f cm)", final_cm, target_cm)
+            # Init ping
+            await self.client.write_gatt_char(
+                RX_CHAR_UUID,
+                STOP_COMMAND,
+                response=False,
+            )
+            await asyncio.sleep(0.3)
+
+            self._stop_requested = False
+            start_cm = self.current_status.get("height_cm", 0)
+            last_cm = start_cm
+            stalled_steps = 0
+            _LOGGER.info(
+                "Moving %s: %.0f cm -> %.0f cm",
+                direction,
+                start_cm,
+                target_cm,
+            )
+
+            target_reached = False
+            for _step in range(MAX_MOVEMENT_STEPS):
+                if self._stop_requested:
+                    _LOGGER.info(
+                        "Stop requested at %.0f cm",
+                        self.current_status.get("height_cm", 0),
+                    )
+                    break
+
+                current_cm = self.current_status.get("height_cm", last_cm)
+                current_direction = self.current_status.get(
+                    "direction",
+                    "idle",
+                )
+                is_moving = self.current_status.get("is_moving", False)
+
+                if (
+                    direction == "up"
+                    and current_cm >= target_cm - TOLERANCE_CM
+                ):
+                    target_reached = True
+                    break
+                if (
+                    direction == "down"
+                    and current_cm <= target_cm + TOLERANCE_CM
+                ):
+                    target_reached = True
+                    break
+
+                has_progress = abs(current_cm - last_cm) >= 0.1
+                if has_progress or (
+                    is_moving and current_direction == direction
+                ):
+                    stalled_steps = 0
+                else:
+                    stalled_steps += 1
+                    if stalled_steps >= MAX_STALL_STEPS:
+                        _LOGGER.warning(
+                            "Movement aborted after %d stalled updates at "
+                            "%.0f cm (target: %.0f cm)",
+                            stalled_steps,
+                            current_cm,
+                            target_cm,
+                        )
+                        break
+
+                await self.client.write_gatt_char(
+                    RX_CHAR_UUID,
+                    cmd,
+                    response=False,
+                )
+                await asyncio.sleep(MOVEMENT_INTERVAL)
+                last_cm = current_cm
+
+            # Send stop and refresh status so the desk panel is released again.
+            await self.client.write_gatt_char(
+                RX_CHAR_UUID,
+                STOP_COMMAND,
+                response=False,
+            )
+            await asyncio.sleep(0.1)
+            final_cm = self.current_status.get("height_cm", last_cm)
+            if target_reached:
+                _LOGGER.info("Target reached at %.0f cm", final_cm)
+            else:
+                _LOGGER.warning(
+                    "Movement stopped at %.0f cm (target: %.0f cm)",
+                    final_cm,
+                    target_cm,
+                )
 
     async def stop(self) -> None:
         """Stop desk movement."""
         self._stop_requested = True
-        if await self.ensure_connected():
-            await self.client.write_gatt_char(RX_CHAR_UUID, STOP_COMMAND, response=False)
+        if await self.ensure_connected() and self.client:
+            await self.client.write_gatt_char(
+                RX_CHAR_UUID,
+                STOP_COMMAND,
+                response=False,
+            )
             _LOGGER.info("Stop command sent")
 
 
@@ -219,8 +332,14 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     device_name = entry.data.get("device_name", "stand UP- 3131")
 
     connection = StandUpDeskConnection(mac_address, hass)
-    connection.sit_height = entry.options.get(CONF_SIT_HEIGHT, DEFAULT_SIT_HEIGHT)
-    connection.stand_height = entry.options.get(CONF_STAND_HEIGHT, DEFAULT_STAND_HEIGHT)
+    connection.sit_height = entry.options.get(
+        CONF_SIT_HEIGHT,
+        DEFAULT_SIT_HEIGHT,
+    )
+    connection.stand_height = entry.options.get(
+        CONF_STAND_HEIGHT,
+        DEFAULT_STAND_HEIGHT,
+    )
 
     if not await connection.connect():
         _LOGGER.warning("Initial connection failed, will retry")
@@ -252,18 +371,30 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Unload a config entry."""
     connection: StandUpDeskConnection = hass.data[DOMAIN][entry.entry_id]
     await connection.disconnect()
-    unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
+    unload_ok = await hass.config_entries.async_unload_platforms(
+        entry,
+        PLATFORMS,
+    )
     if unload_ok:
         hass.data[DOMAIN].pop(entry.entry_id, None)
     return unload_ok
 
 
-async def _async_options_updated(hass: HomeAssistant, entry: ConfigEntry) -> None:
+async def _async_options_updated(
+    hass: HomeAssistant,
+    entry: ConfigEntry,
+) -> None:
     """Handle options update — sync heights to connection."""
     connection: StandUpDeskConnection = hass.data[DOMAIN].get(entry.entry_id)
     if connection:
-        connection.sit_height = entry.options.get(CONF_SIT_HEIGHT, DEFAULT_SIT_HEIGHT)
-        connection.stand_height = entry.options.get(CONF_STAND_HEIGHT, DEFAULT_STAND_HEIGHT)
+        connection.sit_height = entry.options.get(
+            CONF_SIT_HEIGHT,
+            DEFAULT_SIT_HEIGHT,
+        )
+        connection.stand_height = entry.options.get(
+            CONF_STAND_HEIGHT,
+            DEFAULT_STAND_HEIGHT,
+        )
 
 
 def _get_connections(hass: HomeAssistant) -> list[StandUpDeskConnection]:
@@ -311,6 +442,9 @@ def _register_services(hass: HomeAssistant) -> None:
         DOMAIN, "move_to",
         handle_move_to,
         schema=vol.Schema({
-            vol.Required("height"): vol.All(vol.Coerce(float), vol.Range(min=55, max=135)),
+            vol.Required("height"): vol.All(
+                vol.Coerce(float),
+                vol.Range(min=55, max=135),
+            ),
         }, extra=vol.ALLOW_EXTRA),
     )
