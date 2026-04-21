@@ -64,7 +64,7 @@ After setup, you can configure the sit and stand height presets:
 Each desk device creates the following entities:
 
 | Entity | Type | Description |
-|--------|------|-------------|
+| -------- | ------ | ----------- |
 | Height | Sensor | Current desk height in cm |
 | Movement | Sensor | Movement state: `up`, `down`, or `idle` |
 | Sit height | Number | Configurable sit height preset (65-130 cm) |
@@ -80,7 +80,7 @@ Each desk device creates the following entities:
 Move the desk up, down, or stop.
 
 | Parameter | Required | Description |
-|-----------|----------|-------------|
+| --------- | -------- | ----------- |
 | `action` | Yes | `up`, `down`, or `stop` |
 | `target_height` | No | Target height in cm (overrides preset) |
 
@@ -89,7 +89,7 @@ Move the desk up, down, or stop.
 Move the desk to a specific height.
 
 | Parameter | Required | Description |
-|-----------|----------|-------------|
+| --------- | -------- | ----------- |
 | `height` | Yes | Target height in cm (65-130) |
 
 ### Automation example

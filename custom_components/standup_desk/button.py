@@ -20,18 +20,43 @@ async def async_setup_entry(
     entry: ConfigEntry,
     async_add_entities: AddEntitiesCallback,
 ) -> None:
+    """Set up desk preset button entities from a config entry."""
     connection: StandUpDeskConnection = hass.data[DOMAIN][entry.entry_id]
     mac = entry.data["mac"]
     name = entry.data.get("device_name", "Stand Up Desk")
 
     async_add_entities([
-        StandUpDeskButton(connection, entry, mac, name, "sit", "Sit", "mdi:seat-recline-normal"),
-        StandUpDeskButton(connection, entry, mac, name, "stand", "Stand", "mdi:human-male-height"),
-        StandUpDeskButton(connection, entry, mac, name, "stop", "Stop", "mdi:stop"),
+        StandUpDeskButton(
+            connection,
+            entry,
+            mac,
+            name,
+            "sit",
+            "Sit",
+            "mdi:seat-recline-normal",
+        ),
+        StandUpDeskButton(
+            connection,
+            entry,
+            mac,
+            name,
+            "stand",
+            "Stand",
+            "mdi:human-male-height",
+        ),
+        StandUpDeskButton(
+            connection,
+            entry,
+            mac,
+            name,
+            "stop",
+            "Stop",
+            "mdi:stop",
+        ),
     ])
 
 
-class StandUpDeskButton(ButtonEntity):
+class StandUpDeskButton(ButtonEntity):  # pylint: disable=abstract-method
     """Button entity to trigger a desk action."""
 
     _attr_has_entity_name = True
@@ -57,6 +82,12 @@ class StandUpDeskButton(ButtonEntity):
             manufacturer=MANUFACTURER,
             model=MODEL,
         )
+
+    def press(self) -> None:
+        """Trigger the configured desk action."""
+        if self.hass is None:
+            return
+        self.hass.async_create_task(self.async_press())
 
     async def async_press(self) -> None:
         if self._action == "stop":

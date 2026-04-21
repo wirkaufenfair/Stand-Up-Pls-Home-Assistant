@@ -157,6 +157,25 @@ class FakeClient:
         self.commands.append(command)
 
 
+class OppositeDirectionClient(FakeClient):
+    """Fake client that simulates opposite movement from panel override."""
+
+    def __init__(self, conn):
+        """Initialize client with attached connection."""
+        super().__init__()
+        self.conn = conn
+
+    async def write_gatt_char(self, _uuid, command, response=False):
+        """Record command and inject opposite movement status on UP."""
+        await super().write_gatt_char(_uuid, command, response=response)
+        if command == standup_desk.UP_COMMAND:
+            self.conn.current_status = {
+                "height_cm": 79,
+                "is_moving": True,
+                "direction": "down",
+            }
+
+
 class FakeHass:
     """Minimal Home Assistant stub for async task scheduling."""
 
@@ -167,6 +186,24 @@ class FakeHass:
 
 class MovementRecoveryTests(unittest.IsolatedAsyncioTestCase):
     """Regression tests for stalled desk movement handling."""
+
+    def setUp(self):
+        """Store mutable module constants before each test."""
+        self._original_movement_interval = standup_desk.MOVEMENT_INTERVAL
+        self._original_max_movement_steps = standup_desk.MAX_MOVEMENT_STEPS
+
+    def tearDown(self):
+        """Restore mutable module constants after each test."""
+        setattr(
+            standup_desk,
+            "MOVEMENT_INTERVAL",
+            self._original_movement_interval,
+        )
+        setattr(
+            standup_desk,
+            "MAX_MOVEMENT_STEPS",
+            self._original_max_movement_steps,
+        )
 
     async def test_move_aborts_early_when_height_never_changes(self):
         """Ensure movement stops quickly when the desk reports no progress."""
@@ -196,6 +233,37 @@ class MovementRecoveryTests(unittest.IsolatedAsyncioTestCase):
             (
                 "Movement should stop quickly when the desk is stuck "
                 "or in an error state."
+            ),
+        )
+
+    async def test_move_aborts_when_opposite_direction_is_reported(self):
+        """Ensure panel override in opposite direction stops movement loop."""
+        setattr(standup_desk, "MOVEMENT_INTERVAL", 0)
+        setattr(standup_desk, "MAX_MOVEMENT_STEPS", 20)
+
+        conn = StandUpDeskConnection("AA:BB", cast(Any, FakeHass()))
+        fake_client = OppositeDirectionClient(conn)
+        conn.client = cast(Any, fake_client)
+        conn.is_connected = True
+        conn.current_status = {
+            "height_cm": 80,
+            "is_moving": False,
+            "direction": "idle",
+        }
+
+        await conn.move_to_height(120, "up")
+
+        move_commands = [
+            cmd
+            for cmd in fake_client.commands
+            if cmd == standup_desk.UP_COMMAND
+        ]
+        self.assertLessEqual(
+            len(move_commands),
+            2,
+            (
+                "Movement should stop quickly when opposite direction "
+                "is detected from panel input."
             ),
         )
 

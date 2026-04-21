@@ -5,6 +5,7 @@ import logging
 from typing import Any
 
 from homeassistant.components.sensor import (
+    RestoreSensor,
     SensorDeviceClass,
     SensorEntity,
     SensorStateClass,
@@ -14,7 +15,6 @@ from homeassistant.const import UnitOfLength
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
-from homeassistant.helpers.restore_state import RestoreEntity
 
 from .const import DOMAIN, MANUFACTURER, MODEL
 from . import StandUpDeskConnection
@@ -27,6 +27,7 @@ async def async_setup_entry(
     entry: ConfigEntry,
     async_add_entities: AddEntitiesCallback,
 ) -> None:
+    """Set up desk sensor entities from a config entry."""
     connection: StandUpDeskConnection = hass.data[DOMAIN][entry.entry_id]
     mac = entry.data["mac"]
     name = entry.data.get("device_name", "Stand Up Desk")
@@ -37,7 +38,7 @@ async def async_setup_entry(
     ])
 
 
-class StandUpDeskHeightSensor(SensorEntity, RestoreEntity):
+class StandUpDeskHeightSensor(RestoreSensor):
     """Current desk height in cm."""
 
     _attr_device_class = SensorDeviceClass.DISTANCE
@@ -46,11 +47,21 @@ class StandUpDeskHeightSensor(SensorEntity, RestoreEntity):
     _attr_has_entity_name = True
     _attr_icon = "mdi:tape-measure"
 
-    def __init__(self, connection: StandUpDeskConnection, entry_id: str, mac: str, device_name: str) -> None:
+    def __init__(
+        self,
+        connection: StandUpDeskConnection,
+        entry_id: str,
+        mac: str,
+        device_name: str,
+    ) -> None:
         self._connection = connection
         self._attr_unique_id = f"{entry_id}_height"
         self._attr_name = "Height"
         self._attr_native_value = connection.current_status.get("height_cm")
+        self._attr_extra_state_attributes = {
+            "height_raw": connection.current_status.get("height_raw"),
+            "direction": connection.current_status.get("direction"),
+        }
         self._attr_device_info = DeviceInfo(
             identifiers={(DOMAIN, mac)},
             name=device_name,
@@ -67,13 +78,19 @@ class StandUpDeskHeightSensor(SensorEntity, RestoreEntity):
             return
 
         last_state = await self.async_get_last_state()
-        if last_state is None or last_state.state in ("unknown", "unavailable"):
+        if last_state is None or last_state.state in (
+            "unknown",
+            "unavailable",
+        ):
             return
 
         try:
             self._attr_native_value = float(last_state.state)
         except (ValueError, TypeError):
-            _LOGGER.debug("Cannot restore previous height state: %s", last_state.state)
+            _LOGGER.debug(
+                "Cannot restore previous height state: %s",
+                last_state.state,
+            )
 
     async def async_will_remove_from_hass(self) -> None:
         self._connection.unregister_callback(self._handle_status_update)
@@ -81,17 +98,11 @@ class StandUpDeskHeightSensor(SensorEntity, RestoreEntity):
     @callback
     async def _handle_status_update(self, status: dict[str, Any]) -> None:
         self._attr_native_value = status.get("height_cm")
+        self._attr_extra_state_attributes = {
+            "height_raw": status.get("height_raw"),
+            "direction": status.get("direction"),
+        }
         self.async_write_ha_state()
-
-    @property
-    def extra_state_attributes(self) -> dict[str, Any]:
-        st = self._connection.current_status
-        if st:
-            return {
-                "height_raw": st.get("height_raw"),
-                "direction": st.get("direction"),
-            }
-        return {}
 
 
 class StandUpDeskMovingSensor(SensorEntity):
@@ -100,7 +111,13 @@ class StandUpDeskMovingSensor(SensorEntity):
     _attr_has_entity_name = True
     _attr_icon = "mdi:motion-sensor"
 
-    def __init__(self, connection: StandUpDeskConnection, entry_id: str, mac: str, device_name: str) -> None:
+    def __init__(
+        self,
+        connection: StandUpDeskConnection,
+        entry_id: str,
+        mac: str,
+        device_name: str,
+    ) -> None:
         self._connection = connection
         self._attr_unique_id = f"{entry_id}_moving"
         self._attr_name = "Movement"

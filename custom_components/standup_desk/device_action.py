@@ -37,7 +37,7 @@ async def async_get_actions(
 async def async_call_action(
     hass: HomeAssistant,
     config: dict[str, Any],
-    variables: dict[str, Any],
+    _variables: dict[str, Any],
     context: Context | None,
 ) -> None:
     """Execute a device action."""
@@ -55,7 +55,7 @@ async def async_call_action(
 
 
 async def async_get_action_capabilities(
-    hass: HomeAssistant, config: dict[str, Any]
+    _hass: HomeAssistant, _config: dict[str, Any]
 ) -> dict[str, Any]:
     """Return action capabilities."""
     return {}

@@ -7,8 +7,10 @@ from typing import Any
 import voluptuous as vol
 
 from homeassistant import config_entries
-from homeassistant.components.bluetooth import BluetoothServiceInfoBleak
-from homeassistant.data_entry_flow import FlowResult
+from homeassistant.components.bluetooth import (
+    BluetoothServiceInfoBleak,
+    async_discovered_service_info,
+)
 
 from .const import (
     CONF_SIT_HEIGHT,
@@ -31,9 +33,16 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     def __init__(self) -> None:
         self._discovery_info: BluetoothServiceInfoBleak | None = None
 
+    def is_matching(self, other_flow: Any) -> bool:
+        """Return whether another flow targets the same discovered desk."""
+        other_info = getattr(other_flow, "_discovery_info", None)
+        if self._discovery_info is None or other_info is None:
+            return False
+        return self._discovery_info.address == other_info.address
+
     async def async_step_bluetooth(
         self, discovery_info: BluetoothServiceInfoBleak
-    ) -> FlowResult:
+    ) -> config_entries.ConfigFlowResult:
         """Handle Bluetooth discovery."""
         await self.async_set_unique_id(discovery_info.address)
         self._abort_if_unique_id_configured()
@@ -42,36 +51,42 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
     async def async_step_bluetooth_confirm(
         self, user_input: dict[str, Any] | None = None
-    ) -> FlowResult:
+    ) -> config_entries.ConfigFlowResult:
         """Confirm Bluetooth discovery."""
+        if self._discovery_info is None:
+            return self.async_abort(reason="not_found")
+
+        discovery_info = self._discovery_info
         if user_input is not None:
             return self.async_create_entry(
-                title=self._discovery_info.name or "Stand Up Desk",
+                title=discovery_info.name or "Stand Up Desk",
                 data={
-                    "mac": self._discovery_info.address,
-                    "device_name": self._discovery_info.name or "stand UP- 3131",
+                    "mac": discovery_info.address,
+                    "device_name": (
+                        discovery_info.name or "stand UP- 3131"
+                    ),
                 },
             )
 
         self._set_confirm_only()
         return self.async_show_form(
             step_id="bluetooth_confirm",
-            description_placeholders={"name": self._discovery_info.name},
+            description_placeholders={"name": discovery_info.name},
         )
 
     async def async_step_user(
         self, user_input: dict[str, Any] | None = None
-    ) -> FlowResult:
+    ) -> config_entries.ConfigFlowResult:
         """Handle manual setup."""
         errors: dict[str, str] = {}
 
         if user_input is not None:
             device_name = user_input.get("device_name", "stand UP- 3131")
 
-            # Search for the device via HA Bluetooth
-            from homeassistant.components.bluetooth import async_discovered_service_info
-
-            for info in async_discovered_service_info(self.hass, connectable=True):
+            for info in async_discovered_service_info(
+                self.hass,
+                connectable=True,
+            ):
                 if info.name and device_name.lower() in info.name.lower():
                     await self.async_set_unique_id(info.address)
                     self._abort_if_unique_id_configured()
@@ -106,7 +121,8 @@ class OptionsFlow(config_entries.OptionsFlow):
 
     async def async_step_init(
         self, user_input: dict[str, Any] | None = None
-    ) -> FlowResult:
+    ) -> config_entries.ConfigFlowResult:
+        """Handle options form for desk sit/stand height presets."""
         if user_input is not None:
             return self.async_create_entry(title="", data=user_input)
 
@@ -115,11 +131,17 @@ class OptionsFlow(config_entries.OptionsFlow):
             data_schema=vol.Schema({
                 vol.Optional(
                     CONF_SIT_HEIGHT,
-                    default=self._entry.options.get(CONF_SIT_HEIGHT, DEFAULT_SIT_HEIGHT),
+                    default=self._entry.options.get(
+                        CONF_SIT_HEIGHT,
+                        DEFAULT_SIT_HEIGHT,
+                    ),
                 ): vol.All(int, vol.Range(min=HEIGHT_MIN, max=HEIGHT_MAX)),
                 vol.Optional(
                     CONF_STAND_HEIGHT,
-                    default=self._entry.options.get(CONF_STAND_HEIGHT, DEFAULT_STAND_HEIGHT),
+                    default=self._entry.options.get(
+                        CONF_STAND_HEIGHT,
+                        DEFAULT_STAND_HEIGHT,
+                    ),
                 ): vol.All(int, vol.Range(min=HEIGHT_MIN, max=HEIGHT_MAX)),
             }),
         )

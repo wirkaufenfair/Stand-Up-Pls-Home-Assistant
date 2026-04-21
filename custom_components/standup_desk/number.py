@@ -21,10 +21,11 @@ from .const import (
 
 
 async def async_setup_entry(
-    hass: HomeAssistant,
+    _hass: HomeAssistant,
     entry: ConfigEntry,
     async_add_entities: AddEntitiesCallback,
 ) -> None:
+    """Set up desk height number entities from a config entry."""
     mac = entry.data["mac"]
     name = entry.data.get("device_name", "Stand Up Desk")
 
@@ -46,7 +47,7 @@ async def async_setup_entry(
     ])
 
 
-class StandUpDeskHeightNumber(NumberEntity):
+class StandUpDeskHeightNumber(NumberEntity):  # pylint: disable=abstract-method
     """Number entity for a configurable desk height preset."""
 
     _attr_has_entity_name = True
@@ -80,8 +81,18 @@ class StandUpDeskHeightNumber(NumberEntity):
         )
 
     async def async_set_native_value(self, value: float) -> None:
+        """Set and persist a new preset value asynchronously."""
         self._attr_native_value = int(value)
         # Persist to config entry options
         options = {**self._entry.options, self._key: int(value)}
-        self.hass.config_entries.async_update_entry(self._entry, options=options)
+        self.hass.config_entries.async_update_entry(
+            self._entry,
+            options=options,
+        )
         self.async_write_ha_state()
+
+    def set_native_value(self, value: float) -> None:
+        """Set a new preset value from sync context."""
+        if self.hass is None:
+            return
+        self.hass.async_create_task(self.async_set_native_value(value))

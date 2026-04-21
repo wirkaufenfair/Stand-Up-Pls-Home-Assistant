@@ -236,6 +236,7 @@ class StandUpDeskConnection:
             start_cm = self.current_status.get("height_cm", 0)
             last_cm = start_cm
             stalled_steps = 0
+            opposite_direction_steps = 0
             _LOGGER.info(
                 "Moving %s: %.0f cm -> %.0f cm",
                 direction,
@@ -258,6 +259,23 @@ class StandUpDeskConnection:
                     "idle",
                 )
                 is_moving = self.current_status.get("is_moving", False)
+
+                if (
+                    is_moving
+                    and current_direction in {"up", "down"}
+                    and current_direction != direction
+                ):
+                    opposite_direction_steps += 1
+                    if opposite_direction_steps >= 2:
+                        _LOGGER.warning(
+                            "Movement override detected: desk reports %s "
+                            "while target direction is %s; stopping loop",
+                            current_direction,
+                            direction,
+                        )
+                        break
+                else:
+                    opposite_direction_steps = 0
 
                 if (
                     direction == "up"
