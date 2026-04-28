@@ -290,10 +290,7 @@ class StandUpDeskConnection:
                     target_reached = True
                     break
 
-                has_progress = abs(current_cm - last_cm) >= 0.1
-                if has_progress or (
-                    is_moving and current_direction == direction
-                ):
+                if is_moving and current_direction == direction:
                     stalled_steps = 0
                 else:
                     stalled_steps += 1
@@ -448,21 +445,25 @@ def _register_services(hass: HomeAssistant) -> None:
             await conn.move_to_height(float(height), direction)
 
     hass.services.async_register(
-        DOMAIN, "control",
+        DOMAIN,
+        "control",
         handle_control,
         schema=vol.Schema({
             vol.Required("action"): vol.In(["up", "down", "stop"]),
-            vol.Optional("target_height"): vol.Coerce(float),
-        }, extra=vol.ALLOW_EXTRA),
+            vol.Optional("target_height"): vol.All(
+                vol.Coerce(float),
+                vol.Range(min=65, max=130),
+            ),
+        }),
     )
-
     hass.services.async_register(
-        DOMAIN, "move_to",
+        DOMAIN,
+        "move_to",
         handle_move_to,
         schema=vol.Schema({
             vol.Required("height"): vol.All(
                 vol.Coerce(float),
-                vol.Range(min=55, max=135),
+                vol.Range(min=65, max=130),
             ),
-        }, extra=vol.ALLOW_EXTRA),
+        }),
     )

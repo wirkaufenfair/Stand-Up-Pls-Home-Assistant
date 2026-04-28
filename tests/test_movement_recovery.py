@@ -176,6 +176,28 @@ class OppositeDirectionClient(FakeClient):
             }
 
 
+class PanelStopClient(FakeClient):
+    """Fake client simulating a physical STOP press: desk stays idle but
+    drifts 0.1 cm per HA command, which previously reset the stall counter."""
+
+    def __init__(self, conn):
+        """Initialize client with attached connection."""
+        super().__init__()
+        self.conn = conn
+        self._up_count = 0
+
+    async def write_gatt_char(self, _uuid, command, response=False):
+        """Record command and nudge height slightly while keeping desk idle."""
+        await super().write_gatt_char(_uuid, command, response=response)
+        if command == standup_desk.UP_COMMAND:
+            self._up_count += 1
+            self.conn.current_status = {
+                "height_cm": 80 + self._up_count * 0.1,
+                "is_moving": False,
+                "direction": "idle",
+            }
+
+
 class FakeHass:
     """Minimal Home Assistant stub for async task scheduling."""
 
@@ -264,6 +286,44 @@ class MovementRecoveryTests(unittest.IsolatedAsyncioTestCase):
             (
                 "Movement should stop quickly when opposite direction "
                 "is detected from panel input."
+            ),
+        )
+
+    async def test_move_aborts_when_panel_stop_causes_idle_with_tiny_drift(
+        self,
+    ):
+        """Ensure panel STOP aborts loop even when height drifts 0.1 cm/step.
+
+        Previously the stall counter reset on any height change, allowing the
+        loop to run for the full 30-second window while holding _move_lock.
+        """
+        setattr(standup_desk, "MOVEMENT_INTERVAL", 0)
+        setattr(standup_desk, "MAX_MOVEMENT_STEPS", 50)
+
+        conn = StandUpDeskConnection("AA:BB", cast(Any, FakeHass()))
+        fake_client = PanelStopClient(conn)
+        conn.client = cast(Any, fake_client)
+        conn.is_connected = True
+        conn.current_status = {
+            "height_cm": 80,
+            "is_moving": False,
+            "direction": "idle",
+        }
+
+        await conn.move_to_height(120, "up")
+
+        move_commands = [
+            cmd
+            for cmd in fake_client.commands
+            if cmd == standup_desk.UP_COMMAND
+        ]
+        self.assertLessEqual(
+            len(move_commands),
+            standup_desk.MAX_STALL_STEPS + 1,
+            (
+                "Movement must abort within MAX_STALL_STEPS commands when "
+                "the desk stays idle after a physical panel stop, even if "
+                "height drifts slightly with each HA command."
             ),
         )
 
