@@ -193,6 +193,7 @@ class PanelStopClient(FakeClient):
         if command == standup_desk.UP_COMMAND:
             self._up_count += 1
             self.conn._notification_count += 1
+            self.conn._idle_notification_count += 1
             self.conn.current_status = {
                 "height_cm": 80 + self._up_count * 0.1,
                 "is_moving": False,
@@ -222,6 +223,46 @@ class FrozenHeightMovingClient(FakeClient):
                 "height_cm": 80,  # frozen
                 "is_moving": True,
                 "direction": "up",
+            }
+
+
+class TugOfWarClient(FakeClient):
+    """Simulates physical STOP mid-automation: each BLE UP command
+    makes the desk briefly start (is_moving=True notification) and
+    then the panel STOP overrides it (is_moving=False notification)
+    — both within the same 0.2 s step.  The idle notification is
+    recorded in _idle_notification_count even when current_status is
+    overwritten by a later packet before the loop reads it."""
+
+    def __init__(self, conn):
+        """Initialize client with attached connection."""
+        super().__init__()
+        self.conn = conn
+        self._up_count = 0
+
+    async def write_gatt_char(self, _uuid, command, response=False):
+        """Inject a moving-then-idle notification pair per UP command."""
+        await super().write_gatt_char(_uuid, command, response=response)
+        if command == standup_desk.UP_COMMAND:
+            self._up_count += 1
+            height = 80.0 + self._up_count * 0.1
+            # Desk starts in response to the BLE UP command.
+            self.conn._notification_count += 1
+            self.conn.current_status = {
+                "height_cm": height,
+                "is_moving": True,
+                "direction": "up",
+            }
+            # Physical STOP overrides the motor immediately after.
+            # This notification may be overwritten in current_status
+            # before the loop reads it, but _idle_notification_count
+            # preserves the signal for the idle-interruption check.
+            self.conn._notification_count += 1
+            self.conn._idle_notification_count += 1
+            self.conn.current_status = {
+                "height_cm": height,
+                "is_moving": False,
+                "direction": "idle",
             }
 
 
@@ -393,6 +434,51 @@ class MovementRecoveryTests(unittest.IsolatedAsyncioTestCase):
                 "Movement must abort within ~15 commands when is_moving=True "
                 "notifications keep arriving but height is completely frozen "
                 "(physical stop + HA tug-of-war scenario)."
+            ),
+        )
+
+    async def test_move_aborts_when_physical_stop_causes_idle_notifications(
+        self,
+    ):
+        """Ensure panel STOP is detected via idle BLE notification count.
+
+        Simulates the realistic tug-of-war: each HA UP command makes the
+        desk briefly start (is_moving=True notification), then the physical
+        STOP kicks in (is_moving=False notification) within the same 0.2 s
+        step.  The idle notification can be overwritten in current_status
+        before the loop reads it, so the height-progress check from v1.0.6
+        would not catch this when the desk makes any forward progress.
+        The idle-notification counter introduced in v1.0.7 must abort the
+        loop after 2 idle events (~2-3 UP commands total).
+        """
+        setattr(standup_desk, "MOVEMENT_INTERVAL", 0)
+        setattr(standup_desk, "MAX_MOVEMENT_STEPS", 50)
+
+        conn = StandUpDeskConnection("AA:BB", cast(Any, FakeHass()))
+        fake_client = TugOfWarClient(conn)
+        conn.client = cast(Any, fake_client)
+        conn.is_connected = True
+        conn.current_status = {
+            "height_cm": 80,
+            "is_moving": False,
+            "direction": "idle",
+        }
+
+        await conn.move_to_height(120, "up")
+
+        move_commands = [
+            cmd
+            for cmd in fake_client.commands
+            if cmd == standup_desk.UP_COMMAND
+        ]
+        self.assertLessEqual(
+            len(move_commands),
+            3,
+            (
+                "Movement must abort within 3 UP commands when the physical "
+                "panel STOP repeatedly interrupts HA UP commands — even when "
+                "the idle notification is transiently overwritten in "
+                "current_status before the loop reads it."
             ),
         )
 

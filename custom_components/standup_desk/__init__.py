@@ -100,6 +100,7 @@ class StandUpDeskConnection:
         self._stop_requested = False
         self._move_lock = asyncio.Lock()
         self._notification_count: int = 0
+        self._idle_notification_count: int = 0
 
     async def connect(self) -> bool:
         """Open the BLE connection and subscribe to desk updates."""
@@ -171,6 +172,8 @@ class StandUpDeskConnection:
         status = decode_desk_status(data)
         if status:
             self._notification_count += 1
+            if not status["is_moving"]:
+                self._idle_notification_count += 1
             self.current_status = status
             for callback in self._callbacks:
                 self.hass.async_create_task(callback(status))
@@ -248,6 +251,7 @@ class StandUpDeskConnection:
             # prevent the notification-count stall counter from latching.
             height_checkpoint = start_cm
             height_check_step = 0
+            last_idle_count = self._idle_notification_count
             _LOGGER.info(
                 "Moving %s: %.0f cm -> %.0f cm",
                 direction,
@@ -320,6 +324,26 @@ class StandUpDeskConnection:
                             target_cm,
                         )
                         break
+
+                # Panel-stop detection: abort if the desk reported
+                # idle (is_moving=False) 2+ times since movement
+                # started.  The notification handler records every
+                # idle notification in _idle_notification_count, so
+                # this fires even when current_status was overwritten
+                # by a subsequent is_moving=True packet.
+                idle_since_start = (
+                    self._idle_notification_count - last_idle_count
+                )
+                if idle_since_start >= 2:
+                    _LOGGER.warning(
+                        "Panel stop detected: desk went idle %d "
+                        "times during movement; aborting at "
+                        "%.0f cm (target: %.0f cm)",
+                        idle_since_start,
+                        current_cm,
+                        target_cm,
+                    )
+                    break
 
                 # Height-progress check (every 15 steps ≈ 3 s).
                 height_check_step += 1
