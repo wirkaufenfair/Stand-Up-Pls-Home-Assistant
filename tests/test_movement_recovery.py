@@ -169,6 +169,7 @@ class OppositeDirectionClient(FakeClient):
         """Record command and inject opposite movement status on UP."""
         await super().write_gatt_char(_uuid, command, response=response)
         if command == standup_desk.UP_COMMAND:
+            self.conn._notification_count += 1
             self.conn.current_status = {
                 "height_cm": 79,
                 "is_moving": True,
@@ -191,6 +192,7 @@ class PanelStopClient(FakeClient):
         await super().write_gatt_char(_uuid, command, response=response)
         if command == standup_desk.UP_COMMAND:
             self._up_count += 1
+            self.conn._notification_count += 1
             self.conn.current_status = {
                 "height_cm": 80 + self._up_count * 0.1,
                 "is_moving": False,

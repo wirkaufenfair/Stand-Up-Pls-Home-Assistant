@@ -99,6 +99,7 @@ class StandUpDeskConnection:
         self._callbacks: list = []
         self._stop_requested = False
         self._move_lock = asyncio.Lock()
+        self._notification_count: int = 0
 
     async def connect(self) -> bool:
         """Open the BLE connection and subscribe to desk updates."""
@@ -169,6 +170,7 @@ class StandUpDeskConnection:
         """Process incoming BLE notifications from the desk."""
         status = decode_desk_status(data)
         if status:
+            self._notification_count += 1
             self.current_status = status
             for callback in self._callbacks:
                 self.hass.async_create_task(callback(status))
@@ -237,6 +239,7 @@ class StandUpDeskConnection:
             last_cm = start_cm
             stalled_steps = 0
             opposite_direction_steps = 0
+            last_notif_count = self._notification_count
             _LOGGER.info(
                 "Moving %s: %.0f cm -> %.0f cm",
                 direction,
@@ -290,7 +293,15 @@ class StandUpDeskConnection:
                     target_reached = True
                     break
 
-                if is_moving and current_direction == direction:
+                received_update = (
+                    self._notification_count != last_notif_count
+                )
+                last_notif_count = self._notification_count
+                if (
+                    received_update
+                    and is_moving
+                    and current_direction == direction
+                ):
                     stalled_steps = 0
                 else:
                     stalled_steps += 1
