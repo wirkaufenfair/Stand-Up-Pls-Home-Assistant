@@ -99,6 +99,7 @@ class StandUpDeskConnection:
         self._callbacks: list = []
         self._stop_requested = False
         self._move_lock = asyncio.Lock()
+        self._notification_count: int = 0
 
     async def connect(self) -> bool:
         """Open the BLE connection and subscribe to desk updates."""
@@ -169,6 +170,7 @@ class StandUpDeskConnection:
         """Process incoming BLE notifications from the desk."""
         status = decode_desk_status(data)
         if status:
+            self._notification_count += 1
             self.current_status = status
             for callback in self._callbacks:
                 self.hass.async_create_task(callback(status))
@@ -237,6 +239,15 @@ class StandUpDeskConnection:
             last_cm = start_cm
             stalled_steps = 0
             opposite_direction_steps = 0
+            last_notif_count = self._notification_count
+            # Height-progress checkpoint: abort if the desk hasn't moved
+            # meaningfully towards the target in the last 3 s (15 steps).
+            # This catches the tug-of-war where HA keeps re-issuing move
+            # commands after a physical panel stop and the desk briefly
+            # restarts, generating is_moving=True notifications that
+            # prevent the notification-count stall counter from latching.
+            height_checkpoint = start_cm
+            height_check_step = 0
             _LOGGER.info(
                 "Moving %s: %.0f cm -> %.0f cm",
                 direction,
@@ -290,9 +301,12 @@ class StandUpDeskConnection:
                     target_reached = True
                     break
 
-                has_progress = abs(current_cm - last_cm) >= 0.1
-                if has_progress or (
-                    is_moving and current_direction == direction
+                received_update = self._notification_count != last_notif_count
+                last_notif_count = self._notification_count
+                if (
+                    received_update
+                    and is_moving
+                    and current_direction == direction
                 ):
                     stalled_steps = 0
                 else:
@@ -306,6 +320,26 @@ class StandUpDeskConnection:
                             target_cm,
                         )
                         break
+
+                # Height-progress check (every 15 steps ≈ 3 s).
+                height_check_step += 1
+                if height_check_step >= 15:
+                    progress = (
+                        current_cm - height_checkpoint
+                        if direction == "up"
+                        else height_checkpoint - current_cm
+                    )
+                    if progress < 1.0:
+                        _LOGGER.warning(
+                            "Height stuck (%.1f cm progress towards target "
+                            "in 3 s); aborting at %.0f cm (target: %.0f cm)",
+                            progress,
+                            current_cm,
+                            target_cm,
+                        )
+                        break
+                    height_checkpoint = current_cm
+                    height_check_step = 0
 
                 await self.client.write_gatt_char(
                     RX_CHAR_UUID,
