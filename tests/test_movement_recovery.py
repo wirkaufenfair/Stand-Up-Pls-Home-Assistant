@@ -354,10 +354,10 @@ class MovementRecoveryTests(unittest.IsolatedAsyncioTestCase):
             ),
         )
 
-    async def test_move_aborts_when_height_is_frozen_despite_moving_notifications(
+    async def test_move_aborts_when_height_frozen_despite_moving_notifications(
         self,
     ):
-        """Ensure abort when is_moving=True arrives but height never progresses.
+        """Ensure abort when is_moving=True arrives but height never advances.
 
         Simulates the tug-of-war: physical panel stop followed by HA
         re-commanding the desk.  The desk briefly restarts each time
@@ -391,8 +391,8 @@ class MovementRecoveryTests(unittest.IsolatedAsyncioTestCase):
             16,  # height-progress check fires after 15 steps
             (
                 "Movement must abort within ~15 commands when is_moving=True "
-                "notifications keep arriving but the desk height is completely "
-                "frozen (physical stop + HA tug-of-war scenario)."
+                "notifications keep arriving but height is completely frozen "
+                "(physical stop + HA tug-of-war scenario)."
             ),
         )
 
