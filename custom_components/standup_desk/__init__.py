@@ -307,10 +307,24 @@ class StandUpDeskConnection:
 
                 received_update = self._notification_count != last_notif_count
                 last_notif_count = self._notification_count
+                # Require genuine height progress (≥ 0.2 cm this step) in
+                # addition to a fresh is_moving=True notification before
+                # resetting the stall counter.  Without the height check the
+                # counter was reset every time the desk sent an is_moving=True
+                # packet — even in the tug-of-war where the physical STOP
+                # kills the motor almost immediately after each HA UP command
+                # so the desk moves only ~0.1 cm before stopping, never
+                # sends an is_moving=False notification, and the stall
+                # counter never accumulated enough steps to abort.
+                height_advanced = (
+                    (direction == "up" and current_cm > last_cm + 0.2)
+                    or (direction == "down" and current_cm < last_cm - 0.2)
+                )
                 if (
                     received_update
                     and is_moving
                     and current_direction == direction
+                    and height_advanced
                 ):
                     stalled_steps = 0
                 else:
