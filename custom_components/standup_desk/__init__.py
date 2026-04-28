@@ -240,6 +240,14 @@ class StandUpDeskConnection:
             stalled_steps = 0
             opposite_direction_steps = 0
             last_notif_count = self._notification_count
+            # Height-progress checkpoint: abort if the desk hasn't moved
+            # meaningfully towards the target in the last 3 s (15 steps).
+            # This catches the tug-of-war where HA keeps re-issuing move
+            # commands after a physical panel stop and the desk briefly
+            # restarts, generating is_moving=True notifications that
+            # prevent the notification-count stall counter from latching.
+            height_checkpoint = start_cm
+            height_check_step = 0
             _LOGGER.info(
                 "Moving %s: %.0f cm -> %.0f cm",
                 direction,
@@ -293,9 +301,7 @@ class StandUpDeskConnection:
                     target_reached = True
                     break
 
-                received_update = (
-                    self._notification_count != last_notif_count
-                )
+                received_update = self._notification_count != last_notif_count
                 last_notif_count = self._notification_count
                 if (
                     received_update
@@ -314,6 +320,26 @@ class StandUpDeskConnection:
                             target_cm,
                         )
                         break
+
+                # Height-progress check (every 15 steps ≈ 3 s).
+                height_check_step += 1
+                if height_check_step >= 15:
+                    progress = (
+                        current_cm - height_checkpoint
+                        if direction == "up"
+                        else height_checkpoint - current_cm
+                    )
+                    if progress < 1.0:
+                        _LOGGER.warning(
+                            "Height stuck (%.1f cm progress towards target "
+                            "in 3 s); aborting at %.0f cm (target: %.0f cm)",
+                            progress,
+                            current_cm,
+                            target_cm,
+                        )
+                        break
+                    height_checkpoint = current_cm
+                    height_check_step = 0
 
                 await self.client.write_gatt_char(
                     RX_CHAR_UUID,
@@ -456,25 +482,21 @@ def _register_services(hass: HomeAssistant) -> None:
             await conn.move_to_height(float(height), direction)
 
     hass.services.async_register(
-        DOMAIN,
-        "control",
+        DOMAIN, "control",
         handle_control,
         schema=vol.Schema({
             vol.Required("action"): vol.In(["up", "down", "stop"]),
-            vol.Optional("target_height"): vol.All(
-                vol.Coerce(float),
-                vol.Range(min=65, max=130),
-            ),
-        }),
+            vol.Optional("target_height"): vol.Coerce(float),
+        }, extra=vol.ALLOW_EXTRA),
     )
+
     hass.services.async_register(
-        DOMAIN,
-        "move_to",
+        DOMAIN, "move_to",
         handle_move_to,
         schema=vol.Schema({
             vol.Required("height"): vol.All(
                 vol.Coerce(float),
-                vol.Range(min=65, max=130),
+                vol.Range(min=55, max=135),
             ),
-        }),
+        }, extra=vol.ALLOW_EXTRA),
     )
