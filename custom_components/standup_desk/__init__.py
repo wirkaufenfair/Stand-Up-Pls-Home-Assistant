@@ -32,6 +32,7 @@ from .const import (
     MANUFACTURER,
     MAX_MOVEMENT_STEPS,
     MAX_STALL_STEPS,
+    HEIGHT_PROGRESS_MIN_CM,
     MODEL,
     STARTUP_GRACE_STEPS,
     MOVEMENT_INTERVAL,
@@ -309,43 +310,31 @@ class StandUpDeskConnection:
 
                 received_update = self._notification_count != last_notif_count
                 last_notif_count = self._notification_count
-                # Require genuine height progress (≥ 0.2 cm this step) in
-                # addition to a fresh is_moving=True notification before
-                # resetting the stall counter.  Without the height check the
-                # counter was reset every time the desk sent an is_moving=True
-                # packet — even in the tug-of-war where the physical STOP
-                # kills the motor almost immediately after each HA UP command
-                # so the desk moves only ~0.1 cm before stopping, never
-                # sends an is_moving=False notification, and the stall
-                # counter never accumulated enough steps to abort.
-                height_advanced = (
-                    (direction == "up" and current_cm > last_cm + 0.2)
-                    or (direction == "down" and current_cm < last_cm - 0.2)
-                )
-                # desk_actively_moving is True when the desk sends a
-                # fresh is_moving=True packet in the target direction.
-                # Grace suppression is bypassed in that case so stall
-                # detection fires immediately on tug-of-war scenarios
-                # (physical STOP + HA re-commanding), which also produce
-                # is_moving=True notifications.
-                desk_actively_moving = (
-                    received_update
-                    and is_moving
-                    and current_direction == direction
-                )
-                if startup_grace_steps > 0 and not desk_actively_moving:
-                    # Desk silent/idle at startup — suppress stall so the
-                    # motor has time to spin up before MAX_STALL_STEPS is
-                    # reached.  Reset the height-progress window on every
-                    # grace step so the 3-second check only starts measuring
-                    # from the moment the desk first becomes active.
+                # Stall detection: only fire when the desk is completely
+                # silent — no BLE notification arrived this step.  As long
+                # as the desk sends *any* packet (is_moving=True, idle, or
+                # error) the stall counter is cleared.  This avoids the
+                # previous false-positive where the 0.2 cm/step threshold
+                # fired during motor acceleration when the desk sends
+                # is_moving=True but hasn't yet reached full speed.
+                # Slow tug-of-war (desk moves 0.1 cm/step with no idle
+                # packet) is handled instead by the height-progress window
+                # below (2.0 cm minimum over 15 steps = 3 s).
+                if startup_grace_steps > 0 and not received_update:
+                    # Desk completely silent at startup — give the motor
+                    # time to spin up.  Reset the height-progress window on
+                    # every silent step so it only starts measuring from the
+                    # moment the desk first communicates.
                     startup_grace_steps -= 1
                     height_checkpoint = current_cm
                     height_check_step = 0
-                elif height_advanced:
+                elif received_update:
+                    # Desk is communicating — end startup grace and clear
+                    # the stall counter.
                     startup_grace_steps = 0
                     stalled_steps = 0
                 else:
+                    # Post-grace silence: desk stopped sending notifications.
                     stalled_steps += 1
                     if stalled_steps >= MAX_STALL_STEPS:
                         _LOGGER.warning(
@@ -378,9 +367,12 @@ class StandUpDeskConnection:
                     break
 
                 # Height-progress check (every 15 steps ≈ 3 s).
-                # The grace period resets height_checkpoint and
-                # height_check_step on every silent/idle step, so this
-                # window only starts measuring once the desk is active.
+                # The grace period keeps resetting height_checkpoint on
+                # every silent step, so this window only starts measuring
+                # from the moment the desk first communicates.
+                # Threshold: 2.0 cm — catches slow tug-of-war (0.1 cm/step
+                # × 15 steps = 1.5 cm) while allowing normal TiMotion
+                # movement (≥ 2.5 cm/s × 3 s = 7.5 cm).
                 height_check_step += 1
                 if height_check_step >= 15:
                     progress = (
@@ -388,7 +380,7 @@ class StandUpDeskConnection:
                         if direction == "up"
                         else height_checkpoint - current_cm
                     )
-                    if progress < 1.0:
+                    if progress < HEIGHT_PROGRESS_MIN_CM:
                         _LOGGER.warning(
                             "Height stuck (%.1f cm progress towards target "
                             "in 3 s); aborting at %.0f cm (target: %.0f cm)",

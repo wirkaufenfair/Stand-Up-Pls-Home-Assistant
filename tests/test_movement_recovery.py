@@ -530,23 +530,17 @@ class MovementRecoveryTests(unittest.IsolatedAsyncioTestCase):
     async def test_move_aborts_when_panel_stop_sends_no_idle_notification(
         self,
     ):
-        """Ensure abort when physical STOP silences the desk without idle.
+        """Ensure abort when physical STOP leaves desk barely advancing.
 
-        This is the most common real-world failure mode that survived all
-        previous fixes (v1.0.5 through v1.0.7):
-          * Each HA UP command makes the desk start briefly (is_moving=True
-            notification + 0.1 cm height advance).
-          * The physical STOP kills the motor immediately afterwards, but the
-            desk does NOT send an is_moving=False (idle) notification.
-          * _notification_count increments (BLE packet received).
-          * _idle_notification_count does NOT increment.
-          * height advances 0.1 cm per step.
-        This fooled every prior guard:
-          - stall counter: reset by the is_moving=True notification.
-          - idle-notification counter (v1.0.7): never reaches 2.
-          - height-progress window (v1.0.6): 0.1 * 15 = 1.5 cm > 1 cm.
-        The v1.0.8 stall counter now also requires ≥ 0.2 cm per step, so
-        it fires within MAX_STALL_STEPS (~1 second).
+        Scenario: each HA UP command makes the desk start briefly (is_moving=True
+        notification, 0.1 cm height advance), but the physical STOP kills the
+        motor before an is_moving=False (idle) notification is sent.
+
+        Detection path (v1.0.10): the stall counter is only active when the
+        desk is *completely* silent (no BLE packets at all), so it does not
+        fire here.  Instead the height-progress window catches the pattern:
+        0.1 cm/step × 15 steps = 1.5 cm which is below HEIGHT_PROGRESS_MIN_CM
+        (2.0 cm), so abort happens within ~15 UP commands (~3 s).
         """
         setattr(standup_desk, "MOVEMENT_INTERVAL", 0)
         setattr(standup_desk, "MAX_MOVEMENT_STEPS", 50)
@@ -570,12 +564,13 @@ class MovementRecoveryTests(unittest.IsolatedAsyncioTestCase):
         ]
         self.assertLessEqual(
             len(move_commands),
-            standup_desk.MAX_STALL_STEPS + 1,
+            16,  # height-progress check fires after at most 15 active steps
             (
-                "Movement must abort within MAX_STALL_STEPS UP commands "
-                "when the physical panel STOP repeatedly silences the desk "
-                "motor with no is_moving=False notification, leaving the "
-                "desk barely advancing (0.1 cm per HA step)."
+                "Movement must abort within ~15 UP commands when the physical "
+                "panel STOP repeatedly silences the desk motor with no "
+                "is_moving=False notification, leaving the desk barely "
+                "advancing (0.1 cm per HA step) — caught by the "
+                "HEIGHT_PROGRESS_MIN_CM window (2.0 cm / 3 s)."
             ),
         )
 
