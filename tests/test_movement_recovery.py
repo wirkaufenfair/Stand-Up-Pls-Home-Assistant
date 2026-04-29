@@ -170,6 +170,7 @@ class OppositeDirectionClient(FakeClient):
         await super().write_gatt_char(_uuid, command, response=response)
         if command == standup_desk.UP_COMMAND:
             self.conn._notification_count += 1
+            self.conn._moving_notification_count += 1
             self.conn.current_status = {
                 "height_cm": 79,
                 "is_moving": True,
@@ -219,6 +220,7 @@ class FrozenHeightMovingClient(FakeClient):
             # Desk appears to be moving in target direction but height never
             # actually advances — this keeps resetting the stall counter.
             self.conn._notification_count += 1
+            self.conn._moving_notification_count += 1
             self.conn.current_status = {
                 "height_cm": 80,  # frozen
                 "is_moving": True,
@@ -248,6 +250,7 @@ class TugOfWarClient(FakeClient):
             height = 80.0 + self._up_count * 0.1
             # Desk starts in response to the BLE UP command.
             self.conn._notification_count += 1
+            self.conn._moving_notification_count += 1
             self.conn.current_status = {
                 "height_cm": height,
                 "is_moving": True,
@@ -296,6 +299,7 @@ class TugOfWarNoIdleClient(FakeClient):
             # Desk starts briefly, advances 0.1 cm, then physical STOP
             # silences the motor — no is_moving=False notification follows.
             self.conn._notification_count += 1
+            self.conn._moving_notification_count += 1
             self.conn.current_status = {
                 "height_cm": 80.0 + self._up_count * 0.1,
                 "is_moving": True,
