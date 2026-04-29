@@ -333,9 +333,16 @@ class MovementRecoveryTests(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_move_aborts_early_when_height_never_changes(self):
-        """Ensure movement stops quickly when the desk reports no progress."""
+        """Ensure movement stops after the startup grace + stall budget.
+
+        A completely silent desk (no BLE notifications at all) is suppressed
+        from stall counting for STARTUP_GRACE_STEPS iterations to give the
+        motor time to spin up.  Once grace expires, MAX_STALL_STEPS more
+        silent steps trigger the abort, keeping the total well under the
+        30-second MAX_MOVEMENT_STEPS ceiling.
+        """
         setattr(standup_desk, "MOVEMENT_INTERVAL", 0)
-        setattr(standup_desk, "MAX_MOVEMENT_STEPS", 20)
+        setattr(standup_desk, "MAX_MOVEMENT_STEPS", 50)
 
         conn = StandUpDeskConnection("AA:BB", cast(Any, FakeHass()))
         fake_client = FakeClient()
@@ -356,10 +363,11 @@ class MovementRecoveryTests(unittest.IsolatedAsyncioTestCase):
         ]
         self.assertLessEqual(
             len(move_commands),
-            5,
+            standup_desk.STARTUP_GRACE_STEPS + standup_desk.MAX_STALL_STEPS,
             (
-                "Movement should stop quickly when the desk is stuck "
-                "or in an error state."
+                "Movement should stop within the startup grace window plus "
+                "the stall budget when the desk never sends any BLE "
+                "notifications (stuck or error state)."
             ),
         )
 
