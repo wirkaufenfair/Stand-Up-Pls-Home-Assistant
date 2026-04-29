@@ -307,6 +307,59 @@ class TugOfWarNoIdleClient(FakeClient):
             }
 
 
+class PresetButtonInterruptClient(FakeClient):
+    """Simulates pressing a preset button (e.g. '1') while HA is moving up.
+
+    The desk executes 3 normal UP steps, then the panel preset triggers:
+    - One idle notification (desk stops current motion)
+    - Subsequent UP commands → desk reports moving DOWN (to the preset)
+
+    The key regression: after the opposite-direction abort, HA must NOT
+    send a STOP command, because the desk is already executing the panel's
+    preset move.  A spurious BLE STOP would cancel the preset mid-way and
+    leave the TiMotion firmware confused, making the panel unresponsive.
+    """
+
+    def __init__(self, conn):
+        """Initialize client with attached connection."""
+        super().__init__()
+        self.conn = conn
+        self._up_count = 0
+
+    async def write_gatt_char(self, _uuid, command, response=False):
+        """Record command; simulate panel preset after 3 normal UP steps."""
+        await super().write_gatt_char(_uuid, command, response=response)
+        if command == standup_desk.UP_COMMAND:
+            self._up_count += 1
+            if self._up_count <= 3:
+                # Normal desk movement upward.
+                self.conn._notification_count += 1
+                self.conn._moving_notification_count += 1
+                self.conn.current_status = {
+                    "height_cm": 80.0 + self._up_count * 2.5,
+                    "is_moving": True,
+                    "direction": "up",
+                }
+            elif self._up_count == 4:
+                # Panel preset button pressed: desk first goes idle.
+                self.conn._notification_count += 1
+                self.conn._idle_notification_count += 1
+                self.conn.current_status = {
+                    "height_cm": 87.5,
+                    "is_moving": False,
+                    "direction": "idle",
+                }
+            else:
+                # Desk now executing panel preset DOWN move.
+                self.conn._notification_count += 1
+                self.conn._moving_notification_count += 1
+                self.conn.current_status = {
+                    "height_cm": 87.5 - (self._up_count - 4) * 2.5,
+                    "is_moving": True,
+                    "direction": "down",
+                }
+
+
 class FakeHass:
     """Minimal Home Assistant stub for async task scheduling."""
 
@@ -536,8 +589,9 @@ class MovementRecoveryTests(unittest.IsolatedAsyncioTestCase):
     ):
         """Ensure abort when physical STOP leaves desk barely advancing.
 
-        Scenario: each HA UP command makes the desk start briefly (is_moving=True
-        notification, 0.1 cm height advance), but the physical STOP kills the
+        Scenario: each HA UP command makes the desk start briefly
+        (is_moving=True notification, 0.1 cm height advance), but the
+        physical STOP kills the
         motor before an is_moving=False (idle) notification is sent.
 
         Detection path (v1.0.10): the stall counter is only active when the
@@ -576,6 +630,56 @@ class MovementRecoveryTests(unittest.IsolatedAsyncioTestCase):
                 "advancing (0.1 cm per HA step) — caught by the "
                 "HEIGHT_PROGRESS_MIN_CM window (2.0 cm / 3 s)."
             ),
+        )
+
+    async def test_panel_preset_interrupt_sends_no_stop(self):
+        """No STOP command after preset-button abort (opposite-direction path).
+
+        Regression: pressing a physical preset button (e.g. '1') while HA
+        moves up causes the desk to start a panel-controlled DOWN move.
+        HA must abort quickly (opposite-direction guard) and must NOT issue
+        a final BLE STOP, because that STOP would cancel the panel's preset
+        move mid-way and leave the TiMotion firmware confused with a locked
+        panel.
+        """
+        setattr(standup_desk, "MOVEMENT_INTERVAL", 0)
+        setattr(standup_desk, "MAX_MOVEMENT_STEPS", 20)
+
+        conn = StandUpDeskConnection("AA:BB", cast(Any, FakeHass()))
+        fake_client = PresetButtonInterruptClient(conn)
+        conn.client = cast(Any, fake_client)
+        conn.is_connected = True
+        conn.current_status = {
+            "height_cm": 80,
+            "is_moving": False,
+            "direction": "idle",
+        }
+
+        await conn.move_to_height(120, "up")
+
+        stop_commands_after_first = [
+            cmd
+            for cmd in fake_client.commands[1:]  # skip the init-ping STOP
+            if cmd == standup_desk.STOP_COMMAND
+        ]
+        self.assertEqual(
+            len(stop_commands_after_first),
+            0,
+            "No STOP command must be sent after a panel preset-button abort: "
+            "the desk is executing the panel's preset move and a spurious "
+            "BLE STOP would cancel it, leaving the panel unresponsive.",
+        )
+
+        move_commands = [
+            cmd
+            for cmd in fake_client.commands
+            if cmd == standup_desk.UP_COMMAND
+        ]
+        self.assertLessEqual(
+            len(move_commands),
+            6,
+            "Movement loop must abort within a few steps when the desk "
+            "reports opposite direction after a panel preset press.",
         )
 
 
