@@ -306,16 +306,21 @@ class StandUpDeskConnection:
                     and current_direction in {"up", "down"}
                     and current_direction != direction
                 ):
+                    # Single observation is enough: is_moving=True with a
+                    # direction opposite to our target is an unambiguous
+                    # sign that the panel (preset button) took over.
+                    # Debouncing here would let HA send another UP command
+                    # in parallel with the panel's preset move, which the
+                    # TiMotion firmware reacts to by locking up the panel.
                     opposite_direction_steps += 1
-                    if opposite_direction_steps >= 2:
-                        _LOGGER.warning(
-                            "Movement override detected: desk reports %s "
-                            "while target direction is %s; stopping loop",
-                            current_direction,
-                            direction,
-                        )
-                        panel_abort = True
-                        break
+                    _LOGGER.warning(
+                        "Movement override detected: desk reports %s "
+                        "while target direction is %s; stopping loop",
+                        current_direction,
+                        direction,
+                    )
+                    panel_abort = True
+                    break
                 else:
                     opposite_direction_steps = 0
 
