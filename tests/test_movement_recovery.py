@@ -310,14 +310,17 @@ class TugOfWarNoIdleClient(FakeClient):
 class PresetButtonInterruptClient(FakeClient):
     """Simulates pressing a preset button (e.g. '1') while HA is moving up.
 
-    The desk executes 3 normal UP steps, then the panel preset triggers:
-    - One idle notification (desk stops current motion)
-    - Subsequent UP commands → desk reports moving DOWN (to the preset)
+    The desk executes 3 normal UP steps, then the panel preset triggers.
+    TiMotion firmware sends the idle and the following moving-DOWN packet
+    close enough together that both arrive within the same 0.2 s step:
+    - idle notification (desk stops current motion)
+    - moving/down notification (preset move starts)
 
-    The key regression: after the opposite-direction abort, HA must NOT
-    send a STOP command, because the desk is already executing the panel's
-    preset move.  A spurious BLE STOP would cancel the preset mid-way and
-    leave the TiMotion firmware confused, making the panel unresponsive.
+    This causes the opposite-direction guard to fire on the *next* loop
+    iteration, before the idle-abort check can trigger.  HA must NOT send
+    a STOP command, because the desk is already executing the preset move.
+    A spurious BLE STOP would cancel the preset mid-way and leave the
+    TiMotion firmware confused, making the panel unresponsive.
     """
 
     def __init__(self, conn):
@@ -340,17 +343,14 @@ class PresetButtonInterruptClient(FakeClient):
                     "is_moving": True,
                     "direction": "up",
                 }
-            elif self._up_count == 4:
-                # Panel preset button pressed: desk first goes idle.
+            else:
+                # Panel preset: desk goes idle then immediately starts DOWN.
+                # Both packets arrive within the same 0.2 s MOVEMENT_INTERVAL
+                # so the loop reads the final current_status (moving/down)
+                # on the next iteration and hits the opposite-direction guard
+                # before the idle-abort threshold can fire.
                 self.conn._notification_count += 1
                 self.conn._idle_notification_count += 1
-                self.conn.current_status = {
-                    "height_cm": 87.5,
-                    "is_moving": False,
-                    "direction": "idle",
-                }
-            else:
-                # Desk now executing panel preset DOWN move.
                 self.conn._notification_count += 1
                 self.conn._moving_notification_count += 1
                 self.conn.current_status = {
@@ -366,11 +366,9 @@ class PanelButtonStopClient(FakeClient):
     The desk executes 3 normal UP steps, then the panel button press
     causes it to go idle and stay idle (no preset move follows).
 
-    Regression: the idle-detection abort (idle_since_motion >= 2) set
-    panel_abort=True which previously also suppressed the final STOP
-    command.  For this case the desk is already idle — NOT executing a
-    panel preset — so a STOP must still be sent to cleanly reset the
-    TiMotion firmware state and restore panel responsiveness.
+    Regression: the idle-detection abort (idle_since_motion >= 1) must
+    still send a final STOP so the TiMotion firmware state is reset and
+    the panel becomes responsive again.
     """
 
     def __init__(self, conn):
@@ -419,6 +417,13 @@ class MovementRecoveryTests(unittest.IsolatedAsyncioTestCase):
         """Store mutable module constants before each test."""
         self._original_movement_interval = standup_desk.MOVEMENT_INTERVAL
         self._original_max_movement_steps = standup_desk.MAX_MOVEMENT_STEPS
+        self._original_idle_abort_delay = (
+            standup_desk.IDLE_ABORT_PRESET_CHECK_DELAY
+        )
+        # Disable the post-idle-abort delay for all tests so they don't
+        # incur the real 500 ms wait.  Tests that exercise the idle-abort
+        # path rely on this being 0 to keep runs fast.
+        setattr(standup_desk, "IDLE_ABORT_PRESET_CHECK_DELAY", 0)
 
     def tearDown(self):
         """Restore mutable module constants after each test."""
@@ -431,6 +436,11 @@ class MovementRecoveryTests(unittest.IsolatedAsyncioTestCase):
             standup_desk,
             "MAX_MOVEMENT_STEPS",
             self._original_max_movement_steps,
+        )
+        setattr(
+            standup_desk,
+            "IDLE_ABORT_PRESET_CHECK_DELAY",
+            self._original_idle_abort_delay,
         )
 
     async def test_move_aborts_early_when_height_never_changes(self):
@@ -595,7 +605,8 @@ class MovementRecoveryTests(unittest.IsolatedAsyncioTestCase):
         before the loop reads it, so the height-progress check from v1.0.6
         would not catch this when the desk makes any forward progress.
         The idle-notification counter introduced in v1.0.7 must abort the
-        loop after 2 idle events (~2-3 UP commands total).
+        loop after 1 idle event (threshold lowered from 2 to 1 in v1.0.16
+        to prevent the extra UP command that was confusing the firmware).
         """
         setattr(standup_desk, "MOVEMENT_INTERVAL", 0)
         setattr(standup_desk, "MAX_MOVEMENT_STEPS", 50)
@@ -619,12 +630,13 @@ class MovementRecoveryTests(unittest.IsolatedAsyncioTestCase):
         ]
         self.assertLessEqual(
             len(move_commands),
-            3,
+            2,
             (
-                "Movement must abort within 3 UP commands when the physical "
-                "panel STOP repeatedly interrupts HA UP commands — even when "
-                "the idle notification is transiently overwritten in "
-                "current_status before the loop reads it."
+                "Movement must abort within 2 UP commands when the physical "
+                "panel STOP repeatedly interrupts HA UP commands — the "
+                "threshold-1 idle check fires after the first idle event so "
+                "HA does not send any more UP commands that could interfere "
+                "with a panel-preset move the desk may be transitioning to."
             ),
         )
 

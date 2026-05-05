@@ -49,6 +49,14 @@ BLE_EXCEPTIONS = (BleakError, asyncio.TimeoutError, OSError)
 
 PLATFORMS = [Platform.SENSOR, Platform.NUMBER, Platform.BUTTON]
 
+# After an idle-detection abort (panel stopped HA's movement), wait this long
+# before deciding whether to send a final STOP.  The desk may first go idle
+# and then immediately start a panel-preset move (opposite direction).  A
+# brief wait lets that moving notification arrive so HA can skip the STOP,
+# which would otherwise cancel the preset and leave the panel unresponsive.
+# Tests override this constant to 0 so they don't incur the real delay.
+IDLE_ABORT_PRESET_CHECK_DELAY = 0.5
+
 
 def decode_desk_status(data: bytes) -> dict[str, Any] | None:
     """Decode a 5-byte status packet from the desk.
@@ -278,8 +286,12 @@ class StandUpDeskConnection:
             # BLE STOP would cancel it and leave the TiMotion firmware
             # confused, making the panel appear unresponsive.
             # For idle-detection aborts the desk is already stopped, so
-            # sending STOP is safe and necessary to reset firmware state.
+            # sending STOP is safe and necessary to reset firmware state —
+            # unless the desk starts a preset move during the post-loop wait.
             opposite_dir_abort = False
+            # Set to True when the post-motion idle check triggers the abort.
+            # Used to gate the post-loop preset-detection delay below.
+            idle_abort = False
             _LOGGER.info(
                 "Moving %s: %.0f cm -> %.0f cm",
                 direction,
@@ -394,15 +406,22 @@ class StandUpDeskConnection:
                     idle_since_motion = (
                         self._idle_notification_count - last_idle_count
                     )
-                    if idle_since_motion >= 2:
+                    if idle_since_motion >= 1:
+                        # Abort immediately on the first idle notification
+                        # after confirmed motion: this stops HA from sending
+                        # further UP commands that would interfere with a
+                        # panel-preset move the desk may be transitioning to.
+                        # (A threshold of 2 caused one extra UP command to be
+                        # sent during the transition, confusing the firmware.)
                         _LOGGER.warning(
                             "Panel stop detected: desk went idle %d "
-                            "times after starting movement; aborting at "
+                            "time(s) after starting movement; aborting at "
                             "%.0f cm (target: %.0f cm)",
                             idle_since_motion,
                             current_cm,
                             target_cm,
                         )
+                        idle_abort = True
                         break
                 elif (
                     moved_since_start == 0
@@ -452,12 +471,25 @@ class StandUpDeskConnection:
                 await asyncio.sleep(MOVEMENT_INTERVAL)
                 last_cm = current_cm
 
-            # Only skip the final STOP when the panel is actively executing
-            # a preset move in the opposite direction — sending STOP then
-            # would cancel the panel's preset and confuse the TiMotion
-            # firmware, making the panel appear unresponsive.
-            # For all other exits (normal completion, stall, idle-detection
-            # abort) the STOP is still sent to cleanly reset firmware state.
+            # Decide whether to send a final STOP.
+            # * opposite_dir_abort: desk is executing a panel-preset move in
+            #   the opposite direction — never send STOP (would cancel it).
+            # * idle_abort: desk stopped HA's movement; wait briefly before
+            #   sending STOP so a starting preset move can be detected and
+            #   the STOP skipped for that case too.
+            # * all other exits: send STOP to cleanly reset firmware state.
+            if idle_abort and not opposite_dir_abort:
+                await asyncio.sleep(IDLE_ABORT_PRESET_CHECK_DELAY)
+                post_dir = self.current_status.get("direction", "idle")
+                post_moving = self.current_status.get("is_moving", False)
+                if post_moving and post_dir not in {direction, "idle"}:
+                    _LOGGER.info(
+                        "Panel preset detected after idle abort "
+                        "(direction: %s); skipping final STOP to avoid "
+                        "interrupting preset move",
+                        post_dir,
+                    )
+                    opposite_dir_abort = True
             if not opposite_dir_abort:
                 await self.client.write_gatt_char(
                     RX_CHAR_UUID,
