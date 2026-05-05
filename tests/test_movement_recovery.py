@@ -417,13 +417,6 @@ class MovementRecoveryTests(unittest.IsolatedAsyncioTestCase):
         """Store mutable module constants before each test."""
         self._original_movement_interval = standup_desk.MOVEMENT_INTERVAL
         self._original_max_movement_steps = standup_desk.MAX_MOVEMENT_STEPS
-        self._original_idle_abort_delay = (
-            standup_desk.IDLE_ABORT_PRESET_CHECK_DELAY
-        )
-        # Disable the post-idle-abort delay for all tests so they don't
-        # incur the real 500 ms wait.  Tests that exercise the idle-abort
-        # path rely on this being 0 to keep runs fast.
-        setattr(standup_desk, "IDLE_ABORT_PRESET_CHECK_DELAY", 0)
 
     def tearDown(self):
         """Restore mutable module constants after each test."""
@@ -436,11 +429,6 @@ class MovementRecoveryTests(unittest.IsolatedAsyncioTestCase):
             standup_desk,
             "MAX_MOVEMENT_STEPS",
             self._original_max_movement_steps,
-        )
-        setattr(
-            standup_desk,
-            "IDLE_ABORT_PRESET_CHECK_DELAY",
-            self._original_idle_abort_delay,
         )
 
     async def test_move_aborts_early_when_height_never_changes(self):

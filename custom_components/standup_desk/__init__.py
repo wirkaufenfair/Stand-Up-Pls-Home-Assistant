@@ -49,13 +49,12 @@ BLE_EXCEPTIONS = (BleakError, asyncio.TimeoutError, OSError)
 
 PLATFORMS = [Platform.SENSOR, Platform.NUMBER, Platform.BUTTON]
 
-# After an idle-detection abort (panel stopped HA's movement), wait this long
-# before deciding whether to send a final STOP.  The desk may first go idle
-# and then immediately start a panel-preset move (opposite direction).  A
-# brief wait lets that moving notification arrive so HA can skip the STOP,
-# which would otherwise cancel the preset and leave the panel unresponsive.
-# Tests override this constant to 0 so they don't incur the real delay.
-IDLE_ABORT_PRESET_CHECK_DELAY = 0.5
+# While the desk already reports active motion in the requested direction,
+# HA throttles repeated UP/DOWN writes to reduce BLE command collisions with
+# physical panel actions (especially preset button interrupts).
+# Effective repeat cadence = MOVEMENT_INTERVAL * ACTIVE_MOVE_CMD_REPEAT_STEPS
+# (default: 0.2 s * 3 = 0.6 s).
+ACTIVE_MOVE_CMD_REPEAT_STEPS = 3
 
 
 def decode_desk_status(data: bytes) -> dict[str, Any] | None:
@@ -280,6 +279,7 @@ class StandUpDeskConnection:
             idle_baseline = self._idle_notification_count
             moving_baseline = self._moving_notification_count
             idle_held_stop_limit = 5
+            active_move_cmd_cooldown = 0
             # Set to True only when the panel is actively executing a preset
             # move in the *opposite* direction.  In that case the final STOP
             # must be skipped because the desk is mid-preset and a spurious
@@ -463,11 +463,24 @@ class StandUpDeskConnection:
                     height_checkpoint = current_cm
                     height_check_step = 0
 
-                await self.client.write_gatt_char(
-                    RX_CHAR_UUID,
-                    cmd,
-                    response=False,
-                )
+                should_send_move_cmd = True
+                if is_moving and current_direction == direction:
+                    if active_move_cmd_cooldown < (
+                        ACTIVE_MOVE_CMD_REPEAT_STEPS - 1
+                    ):
+                        active_move_cmd_cooldown += 1
+                        should_send_move_cmd = False
+                    else:
+                        active_move_cmd_cooldown = 0
+                else:
+                    active_move_cmd_cooldown = 0
+
+                if should_send_move_cmd:
+                    await self.client.write_gatt_char(
+                        RX_CHAR_UUID,
+                        cmd,
+                        response=False,
+                    )
                 await asyncio.sleep(MOVEMENT_INTERVAL)
                 last_cm = current_cm
 
