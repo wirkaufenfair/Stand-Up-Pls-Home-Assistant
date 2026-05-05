@@ -162,6 +162,37 @@ class StandUpDeskConnection:
             finally:
                 self.is_connected = False
 
+    async def _release_ble_control_after_panel_interrupt(self) -> None:
+        """Release BLE ownership so the physical panel can fully take over.
+
+        Some TiMotion desks can become unresponsive at the panel after an
+        interrupted HA move if Home Assistant keeps the BLE notification
+        session open.  On panel-interrupt abort paths we therefore stop
+        notifications and disconnect proactively.
+        """
+        if not self.client or not self.is_connected:
+            return
+
+        try:
+            stop_notify = getattr(self.client, "stop_notify", None)
+            if callable(stop_notify):
+                await stop_notify(TX_CHAR_UUID)
+
+            disconnect = getattr(self.client, "disconnect", None)
+            if callable(disconnect):
+                await disconnect()
+
+            _LOGGER.info("Released BLE control after panel interrupt")
+        except BLE_EXCEPTIONS as error:
+            _LOGGER.debug("BLE release after panel interrupt failed: %s", error)
+        except Exception as error:  # pragma: no cover - safety net
+            _LOGGER.debug(
+                "Unexpected BLE release error after panel interrupt: %s",
+                error,
+            )
+        finally:
+            self.is_connected = False
+
     async def ensure_connected(self) -> bool:
         """Return whether the desk is connected, reconnecting if needed."""
         if self.is_connected:
@@ -484,6 +515,12 @@ class StandUpDeskConnection:
                 await asyncio.sleep(MOVEMENT_INTERVAL)
                 last_cm = current_cm
 
+            # Panel-interrupt exits (idle/opposite) should release BLE
+            # ownership so the physical panel can recover immediately.
+            panel_interrupt_abort = opposite_dir_abort or idle_abort
+            if panel_interrupt_abort:
+                await self._release_ble_control_after_panel_interrupt()
+
             # Decide whether to send a final STOP.
             # * opposite_dir_abort: desk is executing a panel-preset move in
             #   the opposite direction — never send STOP (would cancel it).
@@ -492,7 +529,7 @@ class StandUpDeskConnection:
             #   interrupting a preset transition that may begin immediately
             #   after the idle packet.
             # * all other exits: send STOP to cleanly reset firmware state.
-            if not opposite_dir_abort and not idle_abort:
+            if not panel_interrupt_abort:
                 await self.client.write_gatt_char(
                     RX_CHAR_UUID,
                     STOP_COMMAND,

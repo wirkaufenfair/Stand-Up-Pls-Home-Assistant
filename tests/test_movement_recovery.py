@@ -150,11 +150,21 @@ class FakeClient:
     def __init__(self):
         """Initialize the fake client command log."""
         self.commands = []
+        self.stop_notify_calls = 0
+        self.disconnect_calls = 0
 
     async def write_gatt_char(self, _uuid, command, response=False):
         """Record outgoing GATT write commands."""
         _ = response
         self.commands.append(command)
+
+    async def stop_notify(self, _uuid):
+        """Record that notification subscription was stopped."""
+        self.stop_notify_calls += 1
+
+    async def disconnect(self):
+        """Record that BLE disconnect was requested."""
+        self.disconnect_calls += 1
 
 
 class OppositeDirectionClient(FakeClient):
@@ -725,6 +735,12 @@ class MovementRecoveryTests(unittest.IsolatedAsyncioTestCase):
             "Movement loop must abort within a few steps when the desk "
             "reports opposite direction after a panel preset press.",
         )
+        self.assertGreaterEqual(
+            fake_client.disconnect_calls,
+            1,
+            "BLE connection must be released after opposite-direction "
+            "panel interrupt so the panel can take over reliably.",
+        )
 
     async def test_panel_button_stop_sends_no_final_stop(self):
         """No final STOP after idle-detection abort from panel interruption.
@@ -771,6 +787,12 @@ class MovementRecoveryTests(unittest.IsolatedAsyncioTestCase):
             "No STOP command must be sent after an idle-detection abort once "
             "movement has started, to avoid interrupting panel-side preset "
             "transitions and causing panel lockups.",
+        )
+        self.assertGreaterEqual(
+            fake_client.disconnect_calls,
+            1,
+            "BLE connection must be released after idle-abort panel "
+            "interrupt so panel control recovers immediately.",
         )
 
 
