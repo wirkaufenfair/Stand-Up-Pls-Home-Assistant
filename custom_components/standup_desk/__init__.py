@@ -474,23 +474,12 @@ class StandUpDeskConnection:
             # Decide whether to send a final STOP.
             # * opposite_dir_abort: desk is executing a panel-preset move in
             #   the opposite direction — never send STOP (would cancel it).
-            # * idle_abort: desk stopped HA's movement; wait briefly before
-            #   sending STOP so a starting preset move can be detected and
-            #   the STOP skipped for that case too.
+            # * idle_abort: panel interrupted HA movement (desk went idle
+            #   after confirmed motion).  Also skip STOP to avoid
+            #   interrupting a preset transition that may begin immediately
+            #   after the idle packet.
             # * all other exits: send STOP to cleanly reset firmware state.
-            if idle_abort and not opposite_dir_abort:
-                await asyncio.sleep(IDLE_ABORT_PRESET_CHECK_DELAY)
-                post_dir = self.current_status.get("direction", "idle")
-                post_moving = self.current_status.get("is_moving", False)
-                if post_moving and post_dir not in {direction, "idle"}:
-                    _LOGGER.info(
-                        "Panel preset detected after idle abort "
-                        "(direction: %s); skipping final STOP to avoid "
-                        "interrupting preset move",
-                        post_dir,
-                    )
-                    opposite_dir_abort = True
-            if not opposite_dir_abort:
+            if not opposite_dir_abort and not idle_abort:
                 await self.client.write_gatt_char(
                     RX_CHAR_UUID,
                     STOP_COMMAND,

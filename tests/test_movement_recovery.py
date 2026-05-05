@@ -738,19 +738,16 @@ class MovementRecoveryTests(unittest.IsolatedAsyncioTestCase):
             "reports opposite direction after a panel preset press.",
         )
 
-    async def test_panel_button_stop_sends_final_stop(self):
-        """STOP command IS sent after idle-detection abort (no preset move).
+    async def test_panel_button_stop_sends_no_final_stop(self):
+        """No final STOP after idle-detection abort from panel interruption.
 
-        Regression: pressing a panel button that simply stops the desk (not
-        a preset that moves in the opposite direction) caused panel_abort=True
-        via the idle-notification path.  Previously this also suppressed the
-        final BLE STOP command, leaving the TiMotion firmware in a confused
-        state and the panel unresponsive.
+        Regression: while HA is moving, pressing a panel button can first
+        produce idle notifications and then (shortly after) transition into
+        a panel-controlled preset move.  Sending a final BLE STOP in this
+        window can interrupt the panel flow and leave the panel unresponsive.
 
-        When the desk goes idle after motion started and does NOT begin a
-        preset move (no opposite-direction notification), HA must send a
-        final STOP to cleanly reset firmware state and restore panel
-        responsiveness.
+        For idle-abort exits, HA must therefore not send an additional final
+        STOP after movement has started.
         """
         setattr(standup_desk, "MOVEMENT_INTERVAL", 0)
         setattr(standup_desk, "MAX_MOVEMENT_STEPS", 20)
@@ -767,9 +764,9 @@ class MovementRecoveryTests(unittest.IsolatedAsyncioTestCase):
 
         await conn.move_to_height(120, "up")
 
-        # The init-ping STOP and any intermediate STOPs are fine; we only
-        # require that at least one STOP appears after the first UP command
-        # (i.e. after movement started) to reset the firmware state.
+        # The init-ping STOP is expected before movement starts.
+        # After the first UP command (movement phase), there must be no
+        # additional STOP for idle-abort exits.
         first_up_idx = next(
             i
             for i, cmd in enumerate(fake_client.commands)
@@ -780,13 +777,12 @@ class MovementRecoveryTests(unittest.IsolatedAsyncioTestCase):
             for cmd in fake_client.commands[first_up_idx:]
             if cmd == standup_desk.STOP_COMMAND
         ]
-        self.assertGreaterEqual(
+        self.assertEqual(
             len(stop_commands_after_movement),
-            1,
-            "A STOP command must be sent after an idle-detection abort so "
-            "that the TiMotion firmware state is reset and the panel becomes "
-            "responsive again (regression: panel button stop without a "
-            "following preset move left panel unresponsive).",
+            0,
+            "No STOP command must be sent after an idle-detection abort once "
+            "movement has started, to avoid interrupting panel-side preset "
+            "transitions and causing panel lockups.",
         )
 
 
