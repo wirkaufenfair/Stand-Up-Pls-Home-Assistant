@@ -272,12 +272,14 @@ class StandUpDeskConnection:
             idle_baseline = self._idle_notification_count
             moving_baseline = self._moving_notification_count
             idle_held_stop_limit = 5
-            # Set to True when the panel takes over (opposite direction or
-            # panel-stop detection).  In that case the final STOP command
-            # must be skipped: the panel is already in control, and a BLE
-            # STOP would cancel the panel's preset move and confuse the
-            # TiMotion firmware, leaving the panel unresponsive.
-            panel_abort = False
+            # Set to True only when the panel is actively executing a preset
+            # move in the *opposite* direction.  In that case the final STOP
+            # must be skipped because the desk is mid-preset and a spurious
+            # BLE STOP would cancel it and leave the TiMotion firmware
+            # confused, making the panel appear unresponsive.
+            # For idle-detection aborts the desk is already stopped, so
+            # sending STOP is safe and necessary to reset firmware state.
+            opposite_dir_abort = False
             _LOGGER.info(
                 "Moving %s: %.0f cm -> %.0f cm",
                 direction,
@@ -319,7 +321,7 @@ class StandUpDeskConnection:
                         current_direction,
                         direction,
                     )
-                    panel_abort = True
+                    opposite_dir_abort = True
                     break
                 else:
                     opposite_direction_steps = 0
@@ -401,7 +403,6 @@ class StandUpDeskConnection:
                             current_cm,
                             target_cm,
                         )
-                        panel_abort = True
                         break
                 elif (
                     moved_since_start == 0
@@ -415,7 +416,6 @@ class StandUpDeskConnection:
                         current_cm,
                         target_cm,
                     )
-                    panel_abort = True
                     break
 
                 # Height-progress check (every 15 steps ≈ 3 s).
@@ -452,13 +452,13 @@ class StandUpDeskConnection:
                 await asyncio.sleep(MOVEMENT_INTERVAL)
                 last_cm = current_cm
 
-            # Only send STOP when HA was in control of the movement.
-            # If the panel took over (opposite direction or panel-stop
-            # detection), skip the STOP: the panel is already executing
-            # its own command (e.g. a preset move), and a BLE STOP here
-            # would cancel it and leave the TiMotion firmware confused,
-            # making the panel appear unresponsive.
-            if not panel_abort:
+            # Only skip the final STOP when the panel is actively executing
+            # a preset move in the opposite direction — sending STOP then
+            # would cancel the panel's preset and confuse the TiMotion
+            # firmware, making the panel appear unresponsive.
+            # For all other exits (normal completion, stall, idle-detection
+            # abort) the STOP is still sent to cleanly reset firmware state.
+            if not opposite_dir_abort:
                 await self.client.write_gatt_char(
                     RX_CHAR_UUID,
                     STOP_COMMAND,

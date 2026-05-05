@@ -360,6 +360,50 @@ class PresetButtonInterruptClient(FakeClient):
                 }
 
 
+class PanelButtonStopClient(FakeClient):
+    """Simulates pressing a panel button that simply stops desk movement.
+
+    The desk executes 3 normal UP steps, then the panel button press
+    causes it to go idle and stay idle (no preset move follows).
+
+    Regression: the idle-detection abort (idle_since_motion >= 2) set
+    panel_abort=True which previously also suppressed the final STOP
+    command.  For this case the desk is already idle — NOT executing a
+    panel preset — so a STOP must still be sent to cleanly reset the
+    TiMotion firmware state and restore panel responsiveness.
+    """
+
+    def __init__(self, conn):
+        """Initialize client with attached connection."""
+        super().__init__()
+        self.conn = conn
+        self._up_count = 0
+
+    async def write_gatt_char(self, _uuid, command, response=False):
+        """Record command; simulate clean stop after 3 normal UP steps."""
+        await super().write_gatt_char(_uuid, command, response=response)
+        if command == standup_desk.UP_COMMAND:
+            self._up_count += 1
+            if self._up_count <= 3:
+                # Normal desk movement upward.
+                self.conn._notification_count += 1
+                self.conn._moving_notification_count += 1
+                self.conn.current_status = {
+                    "height_cm": 80.0 + self._up_count * 2.5,
+                    "is_moving": True,
+                    "direction": "up",
+                }
+            else:
+                # Panel button pressed: desk goes idle and stays idle.
+                self.conn._notification_count += 1
+                self.conn._idle_notification_count += 1
+                self.conn.current_status = {
+                    "height_cm": 87.5,
+                    "is_moving": False,
+                    "direction": "idle",
+                }
+
+
 class FakeHass:
     """Minimal Home Assistant stub for async task scheduling."""
 
@@ -680,6 +724,57 @@ class MovementRecoveryTests(unittest.IsolatedAsyncioTestCase):
             6,
             "Movement loop must abort within a few steps when the desk "
             "reports opposite direction after a panel preset press.",
+        )
+
+    async def test_panel_button_stop_sends_final_stop(self):
+        """STOP command IS sent after idle-detection abort (no preset move).
+
+        Regression: pressing a panel button that simply stops the desk (not
+        a preset that moves in the opposite direction) caused panel_abort=True
+        via the idle-notification path.  Previously this also suppressed the
+        final BLE STOP command, leaving the TiMotion firmware in a confused
+        state and the panel unresponsive.
+
+        When the desk goes idle after motion started and does NOT begin a
+        preset move (no opposite-direction notification), HA must send a
+        final STOP to cleanly reset firmware state and restore panel
+        responsiveness.
+        """
+        setattr(standup_desk, "MOVEMENT_INTERVAL", 0)
+        setattr(standup_desk, "MAX_MOVEMENT_STEPS", 20)
+
+        conn = StandUpDeskConnection("AA:BB", cast(Any, FakeHass()))
+        fake_client = PanelButtonStopClient(conn)
+        conn.client = cast(Any, fake_client)
+        conn.is_connected = True
+        conn.current_status = {
+            "height_cm": 80,
+            "is_moving": False,
+            "direction": "idle",
+        }
+
+        await conn.move_to_height(120, "up")
+
+        # The init-ping STOP and any intermediate STOPs are fine; we only
+        # require that at least one STOP appears after the first UP command
+        # (i.e. after movement started) to reset the firmware state.
+        first_up_idx = next(
+            i
+            for i, cmd in enumerate(fake_client.commands)
+            if cmd == standup_desk.UP_COMMAND
+        )
+        stop_commands_after_movement = [
+            cmd
+            for cmd in fake_client.commands[first_up_idx:]
+            if cmd == standup_desk.STOP_COMMAND
+        ]
+        self.assertGreaterEqual(
+            len(stop_commands_after_movement),
+            1,
+            "A STOP command must be sent after an idle-detection abort so "
+            "that the TiMotion firmware state is reset and the panel becomes "
+            "responsive again (regression: panel button stop without a "
+            "following preset move left panel unresponsive).",
         )
 
 
