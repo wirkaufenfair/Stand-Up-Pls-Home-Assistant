@@ -462,7 +462,7 @@ class IdleThenPresetTransitionClient(FakeClient):
                 }
 
                 async def _delayed_panel_preset_start() -> None:
-                    await asyncio.sleep(0)
+                    await asyncio.sleep(0.3)
                     self.conn._notification_count += 1
                     self.conn._moving_notification_count += 1
                     self.conn.current_status = {

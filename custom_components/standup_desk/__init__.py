@@ -55,12 +55,11 @@ PLATFORMS = [Platform.SENSOR, Platform.NUMBER, Platform.BUTTON]
 # Effective repeat cadence = MOVEMENT_INTERVAL * ACTIVE_MOVE_CMD_REPEAT_STEPS
 # (default: 0.2 s * 3 = 0.6 s).
 ACTIVE_MOVE_CMD_REPEAT_STEPS = 3
-# After an idle-abort, wait briefly for a panel preset transition.
-# If motion starts within this window, skip the final STOP to avoid
-# cancelling the panel move. If no motion starts, send STOP to reset
-# firmware state before releasing BLE control.
-IDLE_ABORT_PRESET_WAIT_STEPS = 3
-IDLE_ABORT_PRESET_WAIT_INTERVAL = 0.05
+# After an idle-abort, wait for panel handoff before deciding on final STOP.
+# If panel activity appears in this window (any new notification, especially
+# moving notifications), skip the final STOP to avoid cancelling panel moves.
+IDLE_ABORT_HANDOFF_WAIT_STEPS = 12
+IDLE_ABORT_HANDOFF_WAIT_INTERVAL = 0.1
 
 
 def decode_desk_status(data: bytes) -> dict[str, Any] | None:
@@ -202,27 +201,46 @@ class StandUpDeskConnection:
             return True
         return await self.connect()
 
-    async def _idle_abort_panel_motion_started(self) -> bool:
-        """Detect whether panel-side motion starts shortly after idle-abort.
+    async def _idle_abort_panel_handoff_detected(
+        self,
+        notification_baseline: int,
+        moving_baseline: int,
+    ) -> bool:
+        """Detect panel-side activity shortly after idle-abort.
 
-        Some desks emit an idle packet first and only then start a panel
-        preset move. In that narrow transition window, sending a BLE STOP
-        would cancel the preset. If no panel motion starts, a final STOP is
-        beneficial to reset desk firmware state.
+        Some desks emit one or more idle packets first and only then start
+        panel motion (or briefly pulse movement and return idle). In this
+        transition window, sending BLE STOP can interfere with panel control.
+
+        Returns True when panel-side activity is detected and final STOP
+        should be skipped.
         """
-        for _ in range(IDLE_ABORT_PRESET_WAIT_STEPS):
+        for _ in range(IDLE_ABORT_HANDOFF_WAIT_STEPS):
             direction = self.current_status.get("direction", "idle")
-            if self.current_status.get("is_moving", False) and direction in {
-                "up",
-                "down",
-            }:
+            status_shows_motion = (
+                self.current_status.get("is_moving", False)
+                and direction in {"up", "down"}
+            )
+            moving_notification_seen = (
+                self._moving_notification_count > moving_baseline
+            )
+            any_panel_notification_seen = (
+                self._notification_count > notification_baseline
+            )
+            if status_shows_motion or moving_notification_seen:
                 _LOGGER.info(
                     "Idle-abort transitioned into panel motion (%s); "
                     "skipping final STOP",
                     direction,
                 )
                 return True
-            await asyncio.sleep(IDLE_ABORT_PRESET_WAIT_INTERVAL)
+            if any_panel_notification_seen:
+                _LOGGER.info(
+                    "Idle-abort observed additional panel notifications; "
+                    "skipping final STOP",
+                )
+                return True
+            await asyncio.sleep(IDLE_ABORT_HANDOFF_WAIT_INTERVAL)
         return False
 
     def _on_disconnected(self, _client: BleakClient) -> None:
@@ -552,7 +570,14 @@ class StandUpDeskConnection:
             # * all other exits: send STOP to cleanly reset firmware state.
             skip_final_stop = opposite_dir_abort
             if idle_abort and not skip_final_stop:
-                skip_final_stop = await self._idle_abort_panel_motion_started()
+                abort_notif_baseline = self._notification_count
+                abort_moving_baseline = self._moving_notification_count
+                skip_final_stop = await (
+                    self._idle_abort_panel_handoff_detected(
+                        abort_notif_baseline,
+                        abort_moving_baseline,
+                    )
+                )
 
             if not skip_final_stop and self.client and self.is_connected:
                 await self.client.write_gatt_char(
