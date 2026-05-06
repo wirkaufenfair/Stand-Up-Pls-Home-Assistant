@@ -117,6 +117,7 @@ class StandUpDeskConnection:
         self._notification_count: int = 0
         self._idle_notification_count: int = 0
         self._moving_notification_count: int = 0
+        self._expecting_disconnect: bool = False
 
     async def connect(self) -> bool:
         """Open the BLE connection and subscribe to desk updates."""
@@ -161,40 +162,49 @@ class StandUpDeskConnection:
         """Close the BLE connection and stop desk notifications."""
         if self.client and self.is_connected:
             try:
+                self._expecting_disconnect = True
                 await self.client.stop_notify(TX_CHAR_UUID)
                 await self.client.disconnect()
             except BLE_EXCEPTIONS as error:
                 _LOGGER.debug("Disconnect error: %s", error)
             finally:
                 self.is_connected = False
+                self._expecting_disconnect = False
 
-    async def _release_ble_control_after_panel_interrupt(self) -> None:
-        """Release BLE ownership so the physical panel can fully take over.
+    async def _disconnect_without_stop_notify(self, reason: str) -> None:
+        """Disconnect BLE link without sending stop_notify first.
 
-        Some TiMotion desks can become unresponsive at the panel after an
-        interrupted HA move if Home Assistant keeps the BLE notification
-        session open.  On panel-interrupt abort paths we therefore stop
-        notifications and disconnect proactively.
+        Some TiMotion firmware revisions can lock panel control when
+        stop_notify is sent during a panel preset transition. For panel
+        handoff paths we therefore disconnect directly.
         """
         if not self.client or not self.is_connected:
             return
 
         try:
-            client = self.client
-            # Bleak backends expose these as async methods, but static typing
-            # can be incomplete across platform backends/stubs.
-            client_any = client  # type: Any
-            await client_any.stop_notify(TX_CHAR_UUID)
+            self._expecting_disconnect = True
+            client_any = self.client  # type: Any
             await client_any.disconnect()
-
-            _LOGGER.info("Released BLE control after panel interrupt")
+            _LOGGER.info("Released BLE control after panel interrupt (%s)", reason)
         except (BleakError, asyncio.TimeoutError, OSError) as error:
             _LOGGER.debug(
-                "BLE release after panel interrupt failed: %s",
+                "BLE disconnect without stop_notify failed (%s): %s",
+                reason,
                 error,
             )
         finally:
             self.is_connected = False
+            self._expecting_disconnect = False
+
+    async def _release_ble_control_after_panel_interrupt(self) -> None:
+        """Release BLE ownership so the physical panel can fully take over.
+
+        On panel-interrupt abort paths we proactively disconnect BLE so the
+        panel can take over immediately. We intentionally avoid stop_notify
+        here because that GATT operation can lock some TiMotion firmware
+        during panel preset transitions.
+        """
+        await self._disconnect_without_stop_notify("panel_interrupt")
 
     async def ensure_connected(self) -> bool:
         """Return whether the desk is connected, reconnecting if needed."""
@@ -246,7 +256,10 @@ class StandUpDeskConnection:
 
     def _on_disconnected(self, _client: BleakClient) -> None:
         """Handle an unexpected BLE disconnect callback."""
-        _LOGGER.warning("BLE disconnected: %s", self.mac_address)
+        if self._expecting_disconnect:
+            _LOGGER.info("BLE disconnected (expected): %s", self.mac_address)
+        else:
+            _LOGGER.warning("BLE disconnected: %s", self.mac_address)
         self.is_connected = False
 
     def _notification_handler(
@@ -578,13 +591,10 @@ class StandUpDeskConnection:
                 )
                 await asyncio.sleep(0.1)
 
-            # For opposite-direction preset abort: release BLE so the panel
-            # can take full control.
-            # For idle_abort: do NOT disconnect — BLE stop_notify/disconnect
-            # during a panel preset transition locks the TiMotion firmware.
-            # Leave the connection open; it will be reused on the next HA
-            # command or dropped by the BLE supervision timeout.
-            if opposite_dir_abort:
+            # Panel-interrupt exits should release BLE promptly so the panel
+            # can regain control immediately. The release path intentionally
+            # disconnects without stop_notify to avoid TiMotion lockups.
+            if opposite_dir_abort or idle_abort:
                 await self._release_ble_control_after_panel_interrupt()
 
             final_cm = self.current_status.get("height_cm", last_cm)
