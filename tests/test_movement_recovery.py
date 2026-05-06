@@ -799,12 +799,14 @@ class MovementRecoveryTests(unittest.IsolatedAsyncioTestCase):
     async def test_panel_button_stop_no_final_stop_for_safety(
         self,
     ):
-        """Idle-abort must never send final STOP to avoid preset cancellation.
+        """Idle-abort must never send final STOP or disconnect BLE.
 
         Regression: when a panel button stops movement (idle), we cannot
         reliably distinguish between a simple stop vs. a preset that is about
         to start. To avoid cancelling a delayed preset, idle-abort never sends
-        final STOP. Instead, we wait and release BLE safely.
+        final STOP. Crucially, we also must NOT disconnect BLE — calling
+        stop_notify/disconnect during a panel preset transition locks the
+        TiMotion firmware panel permanently.
         """
         setattr(standup_desk, "MOVEMENT_INTERVAL", 0)
         setattr(standup_desk, "MAX_MOVEMENT_STEPS", 20)
@@ -840,20 +842,22 @@ class MovementRecoveryTests(unittest.IsolatedAsyncioTestCase):
             "No final STOP must be sent after idle-abort to avoid "
             "cancelling potential panel presets.",
         )
-        self.assertGreaterEqual(
+        self.assertEqual(
             fake_client.disconnect_calls,
-            1,
-            "BLE connection must be released after idle-abort to allow "
-            "panel control to recover.",
+            0,
+            "BLE must NOT be disconnected on idle-abort: stop_notify/disconnect "
+            "during a panel preset transition locks the TiMotion firmware panel.",
         )
 
     async def test_idle_abort_with_delayed_preset_transition_sends_no_stop(
         self,
     ):
-        """Do not send final STOP when panel preset starts after idle-abort.
+        """No STOP and no BLE disconnect when idle-abort transitions to panel preset.
 
-        This protects the transition window where desks emit idle first and
-        then begin panel-controlled motion a moment later.
+        Calling stop_notify/disconnect during an active panel preset transition
+        locks the TiMotion firmware, leaving the panel completely unresponsive.
+        HA must leave the BLE connection open on idle-abort so the desk can
+        complete the preset uninterrupted.
         """
         setattr(standup_desk, "MOVEMENT_INTERVAL", 0)
         setattr(standup_desk, "MAX_MOVEMENT_STEPS", 20)
@@ -886,10 +890,11 @@ class MovementRecoveryTests(unittest.IsolatedAsyncioTestCase):
             "No final STOP must be sent when idle-abort transitions into "
             "panel-controlled preset motion.",
         )
-        self.assertGreaterEqual(
+        self.assertEqual(
             fake_client.disconnect_calls,
-            1,
-            "BLE must be released after panel interruption paths.",
+            0,
+            "BLE must NOT be disconnected on idle-abort: stop_notify/disconnect "
+            "during a panel preset transition locks the TiMotion firmware panel.",
         )
 
 

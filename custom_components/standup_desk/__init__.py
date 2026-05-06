@@ -560,14 +560,13 @@ class StandUpDeskConnection:
                 await asyncio.sleep(MOVEMENT_INTERVAL)
                 last_cm = current_cm
 
-            panel_interrupt_abort = opposite_dir_abort or idle_abort
-
             # Decide whether to send a final STOP.
-            # * opposite_dir_abort: desk is executing a panel preset move in
+            # * opposite_dir_abort: desk is executing a panel preset in the
             #   opposite direction — never send STOP (would cancel it).
             # * idle_abort: never send STOP; the panel may be transitioning to
-            #   a preset move, and STOP would interfere. Instead, wait for the
-            #   panel to safely assume control.
+            #   a preset move. Also do NOT disconnect BLE — calling
+            #   stop_notify/disconnect during an active panel preset locks the
+            #   TiMotion firmware, leaving the panel completely unresponsive.
             # * all other exits: send STOP to cleanly reset firmware state.
             skip_final_stop = opposite_dir_abort or idle_abort
 
@@ -579,19 +578,13 @@ class StandUpDeskConnection:
                 )
                 await asyncio.sleep(0.1)
 
-            # Panel-interrupt exits should allow the panel to take over safely.
-            # For idle-abort, wait for preset handoff before releasing BLE.
-            if idle_abort:
-                # Give panel enough time to start a preset move if one was
-                # initiated at the time of idle detection.
-                abort_notif_baseline = self._notification_count
-                abort_moving_baseline = self._moving_notification_count
-                await self._idle_abort_panel_handoff_detected(
-                    abort_notif_baseline,
-                    abort_moving_baseline,
-                )
-
-            if panel_interrupt_abort:
+            # For opposite-direction preset abort: release BLE so the panel
+            # can take full control.
+            # For idle_abort: do NOT disconnect — BLE stop_notify/disconnect
+            # during a panel preset transition locks the TiMotion firmware.
+            # Leave the connection open; it will be reused on the next HA
+            # command or dropped by the BLE supervision timeout.
+            if opposite_dir_abort:
                 await self._release_ble_control_after_panel_interrupt()
 
             final_cm = self.current_status.get("height_cm", last_cm)
