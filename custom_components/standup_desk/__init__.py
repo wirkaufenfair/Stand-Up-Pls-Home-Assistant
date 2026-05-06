@@ -118,6 +118,10 @@ class StandUpDeskConnection:
         self._idle_notification_count: int = 0
         self._moving_notification_count: int = 0
         self._expecting_disconnect: bool = False
+        # Set by _notification_handler on every idle packet so the
+        # movement loop can wake from its sleep immediately instead
+        # of waiting up to MOVEMENT_INTERVAL before releasing BLE.
+        self._panel_idle_event: asyncio.Event = asyncio.Event()
 
     async def connect(self) -> bool:
         """Open the BLE connection and subscribe to desk updates."""
@@ -185,7 +189,10 @@ class StandUpDeskConnection:
             self._expecting_disconnect = True
             client_any = self.client  # type: Any
             await client_any.disconnect()
-            _LOGGER.info("Released BLE control after panel interrupt (%s)", reason)
+            _LOGGER.info(
+                "Released BLE control after panel interrupt (%s)",
+                reason,
+            )
         except (BleakError, asyncio.TimeoutError, OSError) as error:
             _LOGGER.debug(
                 "BLE disconnect without stop_notify failed (%s): %s",
@@ -273,6 +280,10 @@ class StandUpDeskConnection:
             self._notification_count += 1
             if not status["is_moving"]:
                 self._idle_notification_count += 1
+                # Wake the movement loop early so it can release BLE
+                # control within one notification round-trip (~5–30 ms)
+                # rather than waiting up to MOVEMENT_INTERVAL (200 ms).
+                self._panel_idle_event.set()
             else:
                 self._moving_notification_count += 1
             self.current_status = status
@@ -570,7 +581,21 @@ class StandUpDeskConnection:
                         cmd,
                         response=False,
                     )
-                await asyncio.sleep(MOVEMENT_INTERVAL)
+                # Responsive sleep: wake up early when an idle packet
+                # arrives so we can release BLE within one BLE
+                # notification round-trip (~5–30 ms) rather than
+                # waiting the full MOVEMENT_INTERVAL (200 ms). Fast
+                # release is critical: TiMotion firmware can lock the
+                # physical panel if BLE stays open too long after the
+                # user presses a panel button during HA movement.
+                self._panel_idle_event.clear()
+                try:
+                    await asyncio.wait_for(
+                        self._panel_idle_event.wait(),
+                        timeout=MOVEMENT_INTERVAL,
+                    )
+                except asyncio.TimeoutError:
+                    pass
                 last_cm = current_cm
 
             # Decide whether to send a final STOP.
