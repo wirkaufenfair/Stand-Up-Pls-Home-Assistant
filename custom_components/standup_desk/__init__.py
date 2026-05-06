@@ -55,10 +55,11 @@ PLATFORMS = [Platform.SENSOR, Platform.NUMBER, Platform.BUTTON]
 # Effective repeat cadence = MOVEMENT_INTERVAL * ACTIVE_MOVE_CMD_REPEAT_STEPS
 # (default: 0.2 s * 3 = 0.6 s).
 ACTIVE_MOVE_CMD_REPEAT_STEPS = 3
-# After an idle-abort, wait for panel handoff before deciding on final STOP.
-# If panel activity appears in this window (any new notification, especially
-# moving notifications), skip the final STOP to avoid cancelling panel moves.
-IDLE_ABORT_HANDOFF_WAIT_STEPS = 12
+# After an idle-abort, wait for panel handoff to complete before releasing BLE.
+# The desk may have a panel preset in flight; we must not send STOP as it
+# would cancel the preset and lock the panel. This window allows the panel
+# to take over safely: 30 × 0.1 s = 3 s.
+IDLE_ABORT_HANDOFF_WAIT_STEPS = 30
 IDLE_ABORT_HANDOFF_WAIT_INTERVAL = 0.1
 
 
@@ -564,20 +565,11 @@ class StandUpDeskConnection:
             # Decide whether to send a final STOP.
             # * opposite_dir_abort: desk is executing a panel preset move in
             #   opposite direction — never send STOP (would cancel it).
-            # * idle_abort: first wait briefly for a panel-preset transition.
-            #   If motion starts, skip STOP; if not, send STOP to reset desk
-            #   firmware state before releasing BLE control.
+            # * idle_abort: never send STOP; the panel may be transitioning to
+            #   a preset move, and STOP would interfere. Instead, wait for the
+            #   panel to safely assume control.
             # * all other exits: send STOP to cleanly reset firmware state.
-            skip_final_stop = opposite_dir_abort
-            if idle_abort and not skip_final_stop:
-                abort_notif_baseline = self._notification_count
-                abort_moving_baseline = self._moving_notification_count
-                skip_final_stop = await (
-                    self._idle_abort_panel_handoff_detected(
-                        abort_notif_baseline,
-                        abort_moving_baseline,
-                    )
-                )
+            skip_final_stop = opposite_dir_abort or idle_abort
 
             if not skip_final_stop and self.client and self.is_connected:
                 await self.client.write_gatt_char(
@@ -587,8 +579,18 @@ class StandUpDeskConnection:
                 )
                 await asyncio.sleep(0.1)
 
-            # Panel-interrupt exits (idle/opposite) should release BLE
-            # ownership so the physical panel can recover immediately.
+            # Panel-interrupt exits should allow the panel to take over safely.
+            # For idle-abort, wait for preset handoff before releasing BLE.
+            if idle_abort:
+                # Give panel enough time to start a preset move if one was
+                # initiated at the time of idle detection.
+                abort_notif_baseline = self._notification_count
+                abort_moving_baseline = self._moving_notification_count
+                await self._idle_abort_panel_handoff_detected(
+                    abort_notif_baseline,
+                    abort_moving_baseline,
+                )
+
             if panel_interrupt_abort:
                 await self._release_ble_control_after_panel_interrupt()
 

@@ -796,14 +796,15 @@ class MovementRecoveryTests(unittest.IsolatedAsyncioTestCase):
             "panel interrupt so the panel can take over reliably.",
         )
 
-    async def test_panel_button_stop_sends_final_stop_when_no_preset_follows(
+    async def test_panel_button_stop_no_final_stop_for_safety(
         self,
     ):
-        """Idle-abort with no preset transition must send final STOP.
+        """Idle-abort must never send final STOP to avoid preset cancellation.
 
-        Regression: if a panel button simply stops movement (idle and stays
-        idle), skipping final STOP can leave desk firmware in a confused
-        state and the panel unresponsive. In this case HA must send STOP.
+        Regression: when a panel button stops movement (idle), we cannot
+        reliably distinguish between a simple stop vs. a preset that is about
+        to start. To avoid cancelling a delayed preset, idle-abort never sends
+        final STOP. Instead, we wait and release BLE safely.
         """
         setattr(standup_desk, "MOVEMENT_INTERVAL", 0)
         setattr(standup_desk, "MAX_MOVEMENT_STEPS", 20)
@@ -820,9 +821,9 @@ class MovementRecoveryTests(unittest.IsolatedAsyncioTestCase):
 
         await conn.move_to_height(120, "up")
 
-        # The init-ping STOP is expected before movement starts. For
-        # idle-abort where no panel preset starts afterwards, one final STOP
-        # during movement teardown is required.
+        # The init-ping STOP is expected before movement starts. After
+        # idle-abort, no additional STOP must be sent (to avoid preset
+        # cancellation risk).
         first_up_idx = next(
             i
             for i, cmd in enumerate(fake_client.commands)
@@ -835,15 +836,15 @@ class MovementRecoveryTests(unittest.IsolatedAsyncioTestCase):
         ]
         self.assertEqual(
             len(stop_commands_after_movement),
-            1,
-            "Exactly one final STOP must be sent when idle-abort does not "
-            "transition into panel-controlled motion.",
+            0,
+            "No final STOP must be sent after idle-abort to avoid "
+            "cancelling potential panel presets.",
         )
         self.assertGreaterEqual(
             fake_client.disconnect_calls,
             1,
-            "BLE connection must be released after idle-abort panel "
-            "interrupt so panel control recovers immediately.",
+            "BLE connection must be released after idle-abort to allow "
+            "panel control to recover.",
         )
 
     async def test_idle_abort_with_delayed_preset_transition_sends_no_stop(
