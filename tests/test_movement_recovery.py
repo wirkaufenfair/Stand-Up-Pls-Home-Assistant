@@ -1,5 +1,6 @@
 """Regression tests for desk movement recovery behavior."""
 
+import asyncio
 import enum
 import importlib
 import sys
@@ -420,6 +421,59 @@ class FakeHass:
         return coro
 
 
+class IdleThenPresetTransitionClient(FakeClient):
+    """Simulates idle-abort followed by delayed panel preset transition.
+
+    Sequence after a few normal UP steps:
+      1) desk emits idle (idle-abort condition)
+      2) shortly after, desk starts moving down from panel preset
+
+    HA must not send a final STOP in this transition window.
+    """
+
+    def __init__(self, conn):
+        """Initialize client with attached connection."""
+        super().__init__()
+        self.conn = conn
+        self._up_count = 0
+        self._transition_scheduled = False
+
+    async def write_gatt_char(self, _uuid, command, response=False):
+        """Record command; schedule delayed preset motion after idle."""
+        await super().write_gatt_char(_uuid, command, response=response)
+        if command == standup_desk.UP_COMMAND:
+            self._up_count += 1
+            if self._up_count <= 3:
+                self.conn._notification_count += 1
+                self.conn._moving_notification_count += 1
+                self.conn.current_status = {
+                    "height_cm": 80.0 + self._up_count * 2.5,
+                    "is_moving": True,
+                    "direction": "up",
+                }
+            elif not self._transition_scheduled:
+                self._transition_scheduled = True
+                self.conn._notification_count += 1
+                self.conn._idle_notification_count += 1
+                self.conn.current_status = {
+                    "height_cm": 87.5,
+                    "is_moving": False,
+                    "direction": "idle",
+                }
+
+                async def _delayed_panel_preset_start() -> None:
+                    await asyncio.sleep(0)
+                    self.conn._notification_count += 1
+                    self.conn._moving_notification_count += 1
+                    self.conn.current_status = {
+                        "height_cm": 87.0,
+                        "is_moving": True,
+                        "direction": "down",
+                    }
+
+                asyncio.create_task(_delayed_panel_preset_start())
+
+
 class MovementRecoveryTests(unittest.IsolatedAsyncioTestCase):
     """Regression tests for stalled desk movement handling."""
 
@@ -742,16 +796,14 @@ class MovementRecoveryTests(unittest.IsolatedAsyncioTestCase):
             "panel interrupt so the panel can take over reliably.",
         )
 
-    async def test_panel_button_stop_sends_no_final_stop(self):
-        """No final STOP after idle-detection abort from panel interruption.
+    async def test_panel_button_stop_sends_final_stop_when_no_preset_follows(
+        self,
+    ):
+        """Idle-abort with no preset transition must send final STOP.
 
-        Regression: while HA is moving, pressing a panel button can first
-        produce idle notifications and then (shortly after) transition into
-        a panel-controlled preset move.  Sending a final BLE STOP in this
-        window can interrupt the panel flow and leave the panel unresponsive.
-
-        For idle-abort exits, HA must therefore not send an additional final
-        STOP after movement has started.
+        Regression: if a panel button simply stops movement (idle and stays
+        idle), skipping final STOP can leave desk firmware in a confused
+        state and the panel unresponsive. In this case HA must send STOP.
         """
         setattr(standup_desk, "MOVEMENT_INTERVAL", 0)
         setattr(standup_desk, "MAX_MOVEMENT_STEPS", 20)
@@ -768,9 +820,55 @@ class MovementRecoveryTests(unittest.IsolatedAsyncioTestCase):
 
         await conn.move_to_height(120, "up")
 
-        # The init-ping STOP is expected before movement starts.
-        # After the first UP command (movement phase), there must be no
-        # additional STOP for idle-abort exits.
+        # The init-ping STOP is expected before movement starts. For
+        # idle-abort where no panel preset starts afterwards, one final STOP
+        # during movement teardown is required.
+        first_up_idx = next(
+            i
+            for i, cmd in enumerate(fake_client.commands)
+            if cmd == standup_desk.UP_COMMAND
+        )
+        stop_commands_after_movement = [
+            cmd
+            for cmd in fake_client.commands[first_up_idx:]
+            if cmd == standup_desk.STOP_COMMAND
+        ]
+        self.assertEqual(
+            len(stop_commands_after_movement),
+            1,
+            "Exactly one final STOP must be sent when idle-abort does not "
+            "transition into panel-controlled motion.",
+        )
+        self.assertGreaterEqual(
+            fake_client.disconnect_calls,
+            1,
+            "BLE connection must be released after idle-abort panel "
+            "interrupt so panel control recovers immediately.",
+        )
+
+    async def test_idle_abort_with_delayed_preset_transition_sends_no_stop(
+        self,
+    ):
+        """Do not send final STOP when panel preset starts after idle-abort.
+
+        This protects the transition window where desks emit idle first and
+        then begin panel-controlled motion a moment later.
+        """
+        setattr(standup_desk, "MOVEMENT_INTERVAL", 0)
+        setattr(standup_desk, "MAX_MOVEMENT_STEPS", 20)
+
+        conn = StandUpDeskConnection("AA:BB", cast(Any, FakeHass()))
+        fake_client = IdleThenPresetTransitionClient(conn)
+        conn.client = cast(Any, fake_client)
+        conn.is_connected = True
+        conn.current_status = {
+            "height_cm": 80,
+            "is_moving": False,
+            "direction": "idle",
+        }
+
+        await conn.move_to_height(120, "up")
+
         first_up_idx = next(
             i
             for i, cmd in enumerate(fake_client.commands)
@@ -784,15 +882,13 @@ class MovementRecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             len(stop_commands_after_movement),
             0,
-            "No STOP command must be sent after an idle-detection abort once "
-            "movement has started, to avoid interrupting panel-side preset "
-            "transitions and causing panel lockups.",
+            "No final STOP must be sent when idle-abort transitions into "
+            "panel-controlled preset motion.",
         )
         self.assertGreaterEqual(
             fake_client.disconnect_calls,
             1,
-            "BLE connection must be released after idle-abort panel "
-            "interrupt so panel control recovers immediately.",
+            "BLE must be released after panel interruption paths.",
         )
 
 

@@ -55,6 +55,12 @@ PLATFORMS = [Platform.SENSOR, Platform.NUMBER, Platform.BUTTON]
 # Effective repeat cadence = MOVEMENT_INTERVAL * ACTIVE_MOVE_CMD_REPEAT_STEPS
 # (default: 0.2 s * 3 = 0.6 s).
 ACTIVE_MOVE_CMD_REPEAT_STEPS = 3
+# After an idle-abort, wait briefly for a panel preset transition.
+# If motion starts within this window, skip the final STOP to avoid
+# cancelling the panel move. If no motion starts, send STOP to reset
+# firmware state before releasing BLE control.
+IDLE_ABORT_PRESET_WAIT_STEPS = 3
+IDLE_ABORT_PRESET_WAIT_INTERVAL = 0.05
 
 
 def decode_desk_status(data: bytes) -> dict[str, Any] | None:
@@ -174,20 +180,17 @@ class StandUpDeskConnection:
             return
 
         try:
-            stop_notify = getattr(self.client, "stop_notify", None)
-            if callable(stop_notify):
-                await stop_notify(TX_CHAR_UUID)
-
-            disconnect = getattr(self.client, "disconnect", None)
-            if callable(disconnect):
-                await disconnect()
+            client = self.client
+            # Bleak backends expose these as async methods, but static typing
+            # can be incomplete across platform backends/stubs.
+            client_any = client  # type: Any
+            await client_any.stop_notify(TX_CHAR_UUID)
+            await client_any.disconnect()
 
             _LOGGER.info("Released BLE control after panel interrupt")
-        except BLE_EXCEPTIONS as error:
-            _LOGGER.debug("BLE release after panel interrupt failed: %s", error)
-        except Exception as error:  # pragma: no cover - safety net
+        except (BleakError, asyncio.TimeoutError, OSError) as error:
             _LOGGER.debug(
-                "Unexpected BLE release error after panel interrupt: %s",
+                "BLE release after panel interrupt failed: %s",
                 error,
             )
         finally:
@@ -198,6 +201,29 @@ class StandUpDeskConnection:
         if self.is_connected:
             return True
         return await self.connect()
+
+    async def _idle_abort_panel_motion_started(self) -> bool:
+        """Detect whether panel-side motion starts shortly after idle-abort.
+
+        Some desks emit an idle packet first and only then start a panel
+        preset move. In that narrow transition window, sending a BLE STOP
+        would cancel the preset. If no panel motion starts, a final STOP is
+        beneficial to reset desk firmware state.
+        """
+        for _ in range(IDLE_ABORT_PRESET_WAIT_STEPS):
+            direction = self.current_status.get("direction", "idle")
+            if self.current_status.get("is_moving", False) and direction in {
+                "up",
+                "down",
+            }:
+                _LOGGER.info(
+                    "Idle-abort transitioned into panel motion (%s); "
+                    "skipping final STOP",
+                    direction,
+                )
+                return True
+            await asyncio.sleep(IDLE_ABORT_PRESET_WAIT_INTERVAL)
+        return False
 
     def _on_disconnected(self, _client: BleakClient) -> None:
         """Handle an unexpected BLE disconnect callback."""
@@ -515,27 +541,32 @@ class StandUpDeskConnection:
                 await asyncio.sleep(MOVEMENT_INTERVAL)
                 last_cm = current_cm
 
-            # Panel-interrupt exits (idle/opposite) should release BLE
-            # ownership so the physical panel can recover immediately.
             panel_interrupt_abort = opposite_dir_abort or idle_abort
-            if panel_interrupt_abort:
-                await self._release_ble_control_after_panel_interrupt()
 
             # Decide whether to send a final STOP.
-            # * opposite_dir_abort: desk is executing a panel-preset move in
-            #   the opposite direction — never send STOP (would cancel it).
-            # * idle_abort: panel interrupted HA movement (desk went idle
-            #   after confirmed motion).  Also skip STOP to avoid
-            #   interrupting a preset transition that may begin immediately
-            #   after the idle packet.
+            # * opposite_dir_abort: desk is executing a panel preset move in
+            #   opposite direction — never send STOP (would cancel it).
+            # * idle_abort: first wait briefly for a panel-preset transition.
+            #   If motion starts, skip STOP; if not, send STOP to reset desk
+            #   firmware state before releasing BLE control.
             # * all other exits: send STOP to cleanly reset firmware state.
-            if not panel_interrupt_abort:
+            skip_final_stop = opposite_dir_abort
+            if idle_abort and not skip_final_stop:
+                skip_final_stop = await self._idle_abort_panel_motion_started()
+
+            if not skip_final_stop and self.client and self.is_connected:
                 await self.client.write_gatt_char(
                     RX_CHAR_UUID,
                     STOP_COMMAND,
                     response=False,
                 )
                 await asyncio.sleep(0.1)
+
+            # Panel-interrupt exits (idle/opposite) should release BLE
+            # ownership so the physical panel can recover immediately.
+            if panel_interrupt_abort:
+                await self._release_ble_control_after_panel_interrupt()
+
             final_cm = self.current_status.get("height_cm", last_cm)
             if target_reached:
                 _LOGGER.info("Target reached at %.0f cm", final_cm)

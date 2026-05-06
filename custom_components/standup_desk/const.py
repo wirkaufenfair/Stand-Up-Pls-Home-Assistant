@@ -30,9 +30,10 @@ HEIGHT_MAX = 130
 TOLERANCE_CM = 3
 MOVEMENT_INTERVAL = 0.2  # seconds between BLE commands
 MAX_MOVEMENT_STEPS = 150  # 150 * 0.2s = 30s max
-MAX_STALL_STEPS = 5  # abort early if the desk stays idle / stuck for too long
-STARTUP_GRACE_STEPS = 15  # 15 × 0.2 s = 3 s window before stall/height-stuck checks activate
-HEIGHT_PROGRESS_MIN_CM = 2.0  # minimum cm the desk must advance per 15-step (3 s) window
+MAX_STALL_STEPS = 5  # abort early if the desk stays idle / stuck too long
+STARTUP_GRACE_STEPS = 15  # 15 × 0.2 s = 3 s startup grace window
+# Minimum cm the desk must advance per 15-step (3 s) progress window.
+HEIGHT_PROGRESS_MIN_CM = 2.0
 
 # Manufacturer info
 MANUFACTURER = "TiMotion"
