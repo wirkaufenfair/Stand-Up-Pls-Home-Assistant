@@ -757,11 +757,13 @@ class MovementRecoveryTests(unittest.IsolatedAsyncioTestCase):
         physical STOP kills the
         motor before an is_moving=False (idle) notification is sent.
 
-        Detection path (v1.0.10): the stall counter is only active when the
-        desk is *completely* silent (no BLE packets at all), so it does not
-        fire here.  Instead the height-progress window catches the pattern:
+        Detection path: the stall counter is only active when the desk is
+        *completely* silent (no BLE packets at all), so it does not fire
+        here.  Instead the height-progress window catches the pattern:
         0.1 cm/step × 15 steps = 1.5 cm which is below HEIGHT_PROGRESS_MIN_CM
-        (2.0 cm), so abort happens within ~15 UP commands (~3 s).
+        (2.0 cm). To reduce false positives, abort now requires two
+        consecutive low-progress windows, so it should happen within ~30 UP
+        commands (~6 s).
         """
         setattr(standup_desk, "MOVEMENT_INTERVAL", 0)
         setattr(standup_desk, "MAX_MOVEMENT_STEPS", 50)
@@ -785,13 +787,14 @@ class MovementRecoveryTests(unittest.IsolatedAsyncioTestCase):
         ]
         self.assertLessEqual(
             len(move_commands),
-            16,  # height-progress check fires after at most 15 active steps
+            31,  # two low-progress windows: at most ~30 active steps
             (
-                "Movement must abort within ~15 UP commands when the physical "
+                "Movement must abort within ~30 UP commands when the physical "
                 "panel STOP repeatedly silences the desk motor with no "
                 "is_moving=False notification, leaving the desk barely "
                 "advancing (0.1 cm per HA step) — caught by the "
-                "HEIGHT_PROGRESS_MIN_CM window (2.0 cm / 3 s)."
+                "HEIGHT_PROGRESS_MIN_CM window (2.0 cm / 3 s) across two "
+                "consecutive windows."
             ),
         )
 

@@ -55,6 +55,7 @@ PLATFORMS = [Platform.SENSOR, Platform.NUMBER, Platform.BUTTON]
 IDLE_ABORT_CONFIRM_STEPS = 10
 IDLE_ABORT_CONFIRM_INTERVAL = 0.05
 IDLE_ABORT_MIN_IDLE_NOTIFICATIONS = 2
+HEIGHT_PROGRESS_FAIL_WINDOWS = 2
 
 
 def decode_desk_status(data: bytes) -> dict[str, Any] | None:
@@ -343,6 +344,7 @@ class StandUpDeskConnection:
             # prevent the notification-count stall counter from latching.
             height_checkpoint = start_cm
             height_check_step = 0
+            low_progress_windows = 0
             # Panel-stop detection has two modes:
             #   * post-motion: once the desk confirms it has started moving
             #     (a fresh is_moving=True notification, or current_status
@@ -546,14 +548,20 @@ class StandUpDeskConnection:
                         else height_checkpoint - current_cm
                     )
                     if progress < HEIGHT_PROGRESS_MIN_CM:
-                        _LOGGER.warning(
-                            "Height stuck (%.1f cm progress towards target "
-                            "in 3 s); aborting at %.0f cm (target: %.0f cm)",
-                            progress,
-                            current_cm,
-                            target_cm,
-                        )
-                        break
+                        low_progress_windows += 1
+                        if low_progress_windows >= HEIGHT_PROGRESS_FAIL_WINDOWS:
+                            _LOGGER.warning(
+                                "Height stuck (%.1f cm progress towards "
+                                "target in 3 s, %d consecutive windows); "
+                                "aborting at %.0f cm (target: %.0f cm)",
+                                progress,
+                                low_progress_windows,
+                                current_cm,
+                                target_cm,
+                            )
+                            break
+                    else:
+                        low_progress_windows = 0
                     height_checkpoint = current_cm
                     height_check_step = 0
 
