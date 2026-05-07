@@ -49,6 +49,11 @@ BLE_EXCEPTIONS = (BleakError, asyncio.TimeoutError, OSError)
 
 PLATFORMS = [Platform.SENSOR, Platform.NUMBER, Platform.BUTTON]
 
+# Some desks emit short transient idle packets during normal movement.
+# Confirm idle briefly before treating it as panel interruption.
+IDLE_ABORT_CONFIRM_STEPS = 4
+IDLE_ABORT_CONFIRM_INTERVAL = 0.03
+
 def decode_desk_status(data: bytes) -> dict[str, Any] | None:
     """Decode a 5-byte status packet from the desk.
 
@@ -204,6 +209,31 @@ class StandUpDeskConnection:
         if self.is_connected:
             return True
         return await self.connect()
+
+    async def _idle_abort_confirmed(self, direction: str) -> bool:
+        """Return True when idle-abort should be treated as real interrupt.
+
+        A single idle packet can be a transient firmware glitch during normal
+        movement. Wait briefly to see whether target-direction movement resumes.
+        """
+        moving_baseline = self._moving_notification_count
+
+        for _ in range(IDLE_ABORT_CONFIRM_STEPS):
+            current_direction = self.current_status.get("direction", "idle")
+            is_moving = self.current_status.get("is_moving", False)
+
+            if is_moving and current_direction == direction:
+                return False
+
+            if self._moving_notification_count > moving_baseline:
+                if current_direction == direction:
+                    return False
+                if current_direction in {"up", "down"}:
+                    return True
+
+            await asyncio.sleep(IDLE_ABORT_CONFIRM_INTERVAL)
+
+        return True
 
     def _on_disconnected(self, _client: BleakClient) -> None:
         """Handle an unexpected BLE disconnect callback."""
@@ -450,6 +480,12 @@ class StandUpDeskConnection:
                         self._idle_notification_count - last_idle_count
                     )
                     if idle_since_motion >= 1:
+                        if not await self._idle_abort_confirmed(direction):
+                            # Transient idle pulse during normal movement.
+                            # Re-arm idle tracking from the latest baseline.
+                            last_idle_count = self._idle_notification_count
+                            continue
+
                         # Abort immediately on the first idle notification
                         # after confirmed motion: this stops HA from sending
                         # further UP commands that would interfere with a

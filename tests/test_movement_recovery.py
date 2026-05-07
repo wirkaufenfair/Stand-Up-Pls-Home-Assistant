@@ -413,6 +413,56 @@ class PanelButtonStopClient(FakeClient):
                 }
 
 
+class TransientIdlePulseClient(FakeClient):
+    """Simulates a short idle glitch during otherwise normal UP movement."""
+
+    def __init__(self, conn):
+        """Initialize client with attached connection."""
+        super().__init__()
+        self.conn = conn
+        self._up_count = 0
+        self._glitch_emitted = False
+
+    async def write_gatt_char(self, _uuid, command, response=False):
+        """Inject one transient idle packet and resume moving shortly after."""
+        await super().write_gatt_char(_uuid, command, response=response)
+        if command != standup_desk.UP_COMMAND:
+            return
+
+        self._up_count += 1
+        if self._up_count == 4 and not self._glitch_emitted:
+            self._glitch_emitted = True
+            self.conn._notification_count += 1
+            self.conn._idle_notification_count += 1
+            self.conn.current_status = {
+                "height_cm": 90.0,
+                "is_moving": False,
+                "direction": "idle",
+            }
+            self.conn._panel_idle_event.set()
+
+            async def _resume_up_motion() -> None:
+                await asyncio.sleep(0.02)
+                self.conn._notification_count += 1
+                self.conn._moving_notification_count += 1
+                self.conn.current_status = {
+                    "height_cm": 92.5,
+                    "is_moving": True,
+                    "direction": "up",
+                }
+
+            asyncio.create_task(_resume_up_motion())
+            return
+
+        self.conn._notification_count += 1
+        self.conn._moving_notification_count += 1
+        self.conn.current_status = {
+            "height_cm": 80.0 + self._up_count * 2.5,
+            "is_moving": True,
+            "direction": "up",
+        }
+
+
 class FakeHass:
     """Minimal Home Assistant stub for async task scheduling."""
 
@@ -908,6 +958,36 @@ class MovementRecoveryTests(unittest.IsolatedAsyncioTestCase):
             0,
             "Idle-abort release must not call stop_notify because that can "
             "lock TiMotion firmware during panel transitions.",
+        )
+
+    async def test_transient_idle_pulse_does_not_abort_normal_up_movement(
+        self,
+    ):
+        """A short idle glitch must not trigger panel-stop abort."""
+        setattr(standup_desk, "MOVEMENT_INTERVAL", 0.05)
+        setattr(standup_desk, "MAX_MOVEMENT_STEPS", 50)
+
+        conn = StandUpDeskConnection("AA:BB", cast(Any, FakeHass()))
+        fake_client = TransientIdlePulseClient(conn)
+        conn.client = cast(Any, fake_client)
+        conn.is_connected = True
+        conn.current_status = {
+            "height_cm": 80,
+            "is_moving": False,
+            "direction": "idle",
+        }
+
+        await conn.move_to_height(120, "up")
+
+        self.assertGreaterEqual(
+            conn.current_status.get("height_cm", 0),
+            117,
+            "Desk should still reach target despite one transient idle pulse.",
+        )
+        self.assertEqual(
+            fake_client.disconnect_calls,
+            0,
+            "Transient idle pulse must not trigger panel-interrupt BLE release.",
         )
 
 
