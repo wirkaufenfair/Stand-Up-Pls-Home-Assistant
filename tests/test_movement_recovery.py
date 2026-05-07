@@ -439,10 +439,14 @@ class TransientIdlePulseClient(FakeClient):
                 "is_moving": False,
                 "direction": "idle",
             }
-            self.conn._panel_idle_event.set()
+            panel_idle_event = getattr(self.conn, "_panel_idle_event", None)
+            if panel_idle_event is not None:
+                panel_idle_event.set()
 
             async def _resume_up_motion() -> None:
-                await asyncio.sleep(0.02)
+                # Simulate a 200 ms glitch — longer than the old 120 ms
+                # window that caused false aborts in production.
+                await asyncio.sleep(0.2)
                 self.conn._notification_count += 1
                 self.conn._moving_notification_count += 1
                 self.conn.current_status = {
@@ -987,7 +991,8 @@ class MovementRecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             fake_client.disconnect_calls,
             0,
-            "Transient idle pulse must not trigger panel-interrupt BLE release.",
+            "Transient idle pulse must not trigger panel-interrupt "
+            "BLE release.",
         )
 
 

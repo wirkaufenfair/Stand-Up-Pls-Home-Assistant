@@ -49,10 +49,12 @@ BLE_EXCEPTIONS = (BleakError, asyncio.TimeoutError, OSError)
 
 PLATFORMS = [Platform.SENSOR, Platform.NUMBER, Platform.BUTTON]
 
-# Some desks emit short transient idle packets during normal movement.
-# Confirm idle briefly before treating it as panel interruption.
-IDLE_ABORT_CONFIRM_STEPS = 4
-IDLE_ABORT_CONFIRM_INTERVAL = 0.03
+# Some desks emit transient idle packets during normal movement that can
+# last several hundred milliseconds before motion resumes.  Confirm idle
+# for up to 500 ms (10 × 50 ms) before treating it as a panel interrupt.
+IDLE_ABORT_CONFIRM_STEPS = 10
+IDLE_ABORT_CONFIRM_INTERVAL = 0.05
+
 
 def decode_desk_status(data: bytes) -> dict[str, Any] | None:
     """Decode a 5-byte status packet from the desk.
@@ -213,8 +215,10 @@ class StandUpDeskConnection:
     async def _idle_abort_confirmed(self, direction: str) -> bool:
         """Return True when idle-abort should be treated as real interrupt.
 
-        A single idle packet can be a transient firmware glitch during normal
-        movement. Wait briefly to see whether target-direction movement resumes.
+        TiMotion desks occasionally emit idle packets during normal movement
+        that can persist for several hundred milliseconds before motion
+        resumes.  Wait up to 500 ms (10 × 50 ms) to see whether target-
+        direction movement resumes before declaring a real panel interrupt.
         """
         moving_baseline = self._moving_notification_count
 
