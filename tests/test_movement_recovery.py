@@ -414,7 +414,7 @@ class PanelButtonStopClient(FakeClient):
 
 
 class TransientIdlePulseClient(FakeClient):
-    """Simulates a short idle glitch during otherwise normal UP movement."""
+    """Simulates one long idle glitch during otherwise normal UP movement."""
 
     def __init__(self, conn):
         """Initialize client with attached connection."""
@@ -424,7 +424,7 @@ class TransientIdlePulseClient(FakeClient):
         self._glitch_emitted = False
 
     async def write_gatt_char(self, _uuid, command, response=False):
-        """Inject one transient idle packet and resume moving shortly after."""
+        """Inject one idle packet and resume moving well after 500 ms."""
         await super().write_gatt_char(_uuid, command, response=response)
         if command != standup_desk.UP_COMMAND:
             return
@@ -444,9 +444,10 @@ class TransientIdlePulseClient(FakeClient):
                 panel_idle_event.set()
 
             async def _resume_up_motion() -> None:
-                # Simulate a 200 ms glitch — longer than the old 120 ms
-                # window that caused false aborts in production.
-                await asyncio.sleep(0.2)
+                # Simulate an 800 ms glitch (longer than the 500 ms
+                # confirmation window) to ensure a *single* idle pulse still
+                # does not trigger abort.
+                await asyncio.sleep(0.8)
                 self.conn._notification_count += 1
                 self.conn._moving_notification_count += 1
                 self.conn.current_status = {
@@ -711,8 +712,8 @@ class MovementRecoveryTests(unittest.IsolatedAsyncioTestCase):
         before the loop reads it, so the height-progress check from v1.0.6
         would not catch this when the desk makes any forward progress.
         The idle-notification counter introduced in v1.0.7 must abort the
-        loop after 1 idle event (threshold lowered from 2 to 1 in v1.0.16
-        to prevent the extra UP command that was confusing the firmware).
+        loop after persistent idleness. To avoid false positives from single
+        transient idle packets, the threshold is now 2 idle events.
         """
         setattr(standup_desk, "MOVEMENT_INTERVAL", 0)
         setattr(standup_desk, "MAX_MOVEMENT_STEPS", 50)
@@ -736,12 +737,12 @@ class MovementRecoveryTests(unittest.IsolatedAsyncioTestCase):
         ]
         self.assertLessEqual(
             len(move_commands),
-            2,
+            3,
             (
-                "Movement must abort within 2 UP commands when the physical "
+                "Movement must abort within 3 UP commands when the physical "
                 "panel STOP repeatedly interrupts HA UP commands — the "
-                "threshold-1 idle check fires after the first idle event so "
-                "HA does not send any more UP commands that could interfere "
+                "idle-threshold check fires after persistent idleness so "
+                "HA quickly stops sending UP commands that could interfere "
                 "with a panel-preset move the desk may be transitioning to."
             ),
         )

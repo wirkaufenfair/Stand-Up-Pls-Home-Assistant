@@ -54,6 +54,7 @@ PLATFORMS = [Platform.SENSOR, Platform.NUMBER, Platform.BUTTON]
 # for up to 500 ms (10 × 50 ms) before treating it as a panel interrupt.
 IDLE_ABORT_CONFIRM_STEPS = 10
 IDLE_ABORT_CONFIRM_INTERVAL = 0.05
+IDLE_ABORT_MIN_IDLE_NOTIFICATIONS = 2
 
 
 def decode_desk_status(data: bytes) -> dict[str, Any] | None:
@@ -345,9 +346,10 @@ class StandUpDeskConnection:
             # Panel-stop detection has two modes:
             #   * post-motion: once the desk confirms it has started moving
             #     (a fresh is_moving=True notification, or current_status
-            #     reporting is_moving=True in the target direction), abort
-            #     after 2 idle notifications.  This catches the tug-of-war
-            #     where panel STOP interrupts active motion.
+            #     reporting is_moving=True in the target direction), only
+            #     consider abort after at least 2 idle notifications and then
+            #     run the idle confirmation window.  This avoids false aborts
+            #     from single transient idle packets observed on some desks.
             #   * held-stop: if the desk never starts moving at all and only
             #     emits idle notifications, abort after IDLE_HELD_STOP_LIMIT
             #     idle notifications.  A higher threshold here avoids false
@@ -457,6 +459,16 @@ class StandUpDeskConnection:
                     # Post-grace silence: desk stopped sending notifications.
                     stalled_steps += 1
                     if stalled_steps >= MAX_STALL_STEPS:
+                        # If we already saw at least one idle notification
+                        # after confirmed motion, this stall can be a delayed
+                        # panel preset handoff (idle first, motion packet
+                        # later). Treat it like idle-abort so we do not send
+                        # a final STOP that could cancel the panel preset.
+                        if (
+                            last_idle_count is not None
+                            and self._idle_notification_count > last_idle_count
+                        ):
+                            idle_abort = True
                         _LOGGER.warning(
                             "Movement aborted after %d stalled updates at "
                             "%.0f cm (target: %.0f cm)",
@@ -483,24 +495,23 @@ class StandUpDeskConnection:
                     idle_since_motion = (
                         self._idle_notification_count - last_idle_count
                     )
-                    if idle_since_motion >= 1:
+                    if idle_since_motion >= IDLE_ABORT_MIN_IDLE_NOTIFICATIONS:
                         if not await self._idle_abort_confirmed(direction):
                             # Transient idle pulse during normal movement.
                             # Re-arm idle tracking from the latest baseline.
                             last_idle_count = self._idle_notification_count
                             continue
 
-                        # Abort immediately on the first idle notification
-                        # after confirmed motion: this stops HA from sending
-                        # further UP commands that would interfere with a
-                        # panel-preset move the desk may be transitioning to.
-                        # (A threshold of 2 caused one extra UP command to be
-                        # sent during the transition, confusing the firmware.)
+                        # Abort once persistent idleness is observed after
+                        # confirmed motion and the confirmation window keeps
+                        # reporting no target-direction movement.
                         _LOGGER.warning(
                             "Panel stop detected: desk went idle %d "
-                            "time(s) after starting movement; aborting at "
+                            "time(s) after starting movement "
+                            "(threshold: %d); aborting at "
                             "%.0f cm (target: %.0f cm)",
                             idle_since_motion,
+                            IDLE_ABORT_MIN_IDLE_NOTIFICATIONS,
                             current_cm,
                             target_cm,
                         )
