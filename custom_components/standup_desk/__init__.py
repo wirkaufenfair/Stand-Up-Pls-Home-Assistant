@@ -49,20 +49,6 @@ BLE_EXCEPTIONS = (BleakError, asyncio.TimeoutError, OSError)
 
 PLATFORMS = [Platform.SENSOR, Platform.NUMBER, Platform.BUTTON]
 
-# While the desk already reports active motion in the requested direction,
-# HA throttles repeated UP/DOWN writes to reduce BLE command collisions with
-# physical panel actions (especially preset button interrupts).
-# Effective repeat cadence = MOVEMENT_INTERVAL * ACTIVE_MOVE_CMD_REPEAT_STEPS
-# (default: 0.2 s * 3 = 0.6 s).
-ACTIVE_MOVE_CMD_REPEAT_STEPS = 3
-# After an idle-abort, wait for panel handoff to complete before releasing BLE.
-# The desk may have a panel preset in flight; we must not send STOP as it
-# would cancel the preset and lock the panel. This window allows the panel
-# to take over safely: 30 × 0.1 s = 3 s.
-IDLE_ABORT_HANDOFF_WAIT_STEPS = 30
-IDLE_ABORT_HANDOFF_WAIT_INTERVAL = 0.1
-
-
 def decode_desk_status(data: bytes) -> dict[str, Any] | None:
     """Decode a 5-byte status packet from the desk.
 
@@ -219,48 +205,6 @@ class StandUpDeskConnection:
             return True
         return await self.connect()
 
-    async def _idle_abort_panel_handoff_detected(
-        self,
-        notification_baseline: int,
-        moving_baseline: int,
-    ) -> bool:
-        """Detect panel-side activity shortly after idle-abort.
-
-        Some desks emit one or more idle packets first and only then start
-        panel motion (or briefly pulse movement and return idle). In this
-        transition window, sending BLE STOP can interfere with panel control.
-
-        Returns True when panel-side activity is detected and final STOP
-        should be skipped.
-        """
-        for _ in range(IDLE_ABORT_HANDOFF_WAIT_STEPS):
-            direction = self.current_status.get("direction", "idle")
-            status_shows_motion = (
-                self.current_status.get("is_moving", False)
-                and direction in {"up", "down"}
-            )
-            moving_notification_seen = (
-                self._moving_notification_count > moving_baseline
-            )
-            any_panel_notification_seen = (
-                self._notification_count > notification_baseline
-            )
-            if status_shows_motion or moving_notification_seen:
-                _LOGGER.info(
-                    "Idle-abort transitioned into panel motion (%s); "
-                    "skipping final STOP",
-                    direction,
-                )
-                return True
-            if any_panel_notification_seen:
-                _LOGGER.info(
-                    "Idle-abort observed additional panel notifications; "
-                    "skipping final STOP",
-                )
-                return True
-            await asyncio.sleep(IDLE_ABORT_HANDOFF_WAIT_INTERVAL)
-        return False
-
     def _on_disconnected(self, _client: BleakClient) -> None:
         """Handle an unexpected BLE disconnect callback."""
         if self._expecting_disconnect:
@@ -379,7 +323,6 @@ class StandUpDeskConnection:
             idle_baseline = self._idle_notification_count
             moving_baseline = self._moving_notification_count
             idle_held_stop_limit = 5
-            active_move_cmd_cooldown = 0
             # Set to True only when the panel is actively executing a preset
             # move in the *opposite* direction.  In that case the final STOP
             # must be skipped because the desk is mid-preset and a spurious
@@ -563,17 +506,19 @@ class StandUpDeskConnection:
                     height_checkpoint = current_cm
                     height_check_step = 0
 
-                should_send_move_cmd = True
-                if is_moving and current_direction == direction:
-                    if active_move_cmd_cooldown < (
-                        ACTIVE_MOVE_CMD_REPEAT_STEPS - 1
-                    ):
-                        active_move_cmd_cooldown += 1
-                        should_send_move_cmd = False
-                    else:
-                        active_move_cmd_cooldown = 0
-                else:
-                    active_move_cmd_cooldown = 0
+                # While the desk reports active motion in the requested
+                # direction AND we keep receiving fresh notifications,
+                # avoid repeated UP/DOWN writes to minimize collision risk
+                # with near-simultaneous panel button actions.
+                #
+                # If notifications go silent, send a fallback move command
+                # to avoid stalling indefinitely on firmwares that require
+                # occasional reinforcement writes.
+                should_send_move_cmd = not (
+                    is_moving
+                    and current_direction == direction
+                    and received_update
+                )
 
                 if should_send_move_cmd:
                     await self.client.write_gatt_char(
