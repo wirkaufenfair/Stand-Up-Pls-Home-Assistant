@@ -55,6 +55,7 @@ PLATFORMS = [Platform.SENSOR, Platform.NUMBER, Platform.BUTTON]
 IDLE_ABORT_CONFIRM_STEPS = 10
 IDLE_ABORT_CONFIRM_INTERVAL = 0.05
 IDLE_ABORT_MIN_IDLE_NOTIFICATIONS = 2
+IDLE_ABORT_CONFIRMED_EPISODES = 2
 HEIGHT_PROGRESS_FAIL_WINDOWS = 2
 
 
@@ -350,14 +351,18 @@ class StandUpDeskConnection:
             #     (a fresh is_moving=True notification, or current_status
             #     reporting is_moving=True in the target direction), only
             #     consider abort after at least 2 idle notifications and then
-            #     run the idle confirmation window.  This avoids false aborts
-            #     from single transient idle packets observed on some desks.
+            #     run the idle confirmation window.  To reduce false positives
+            #     on desks that briefly pause while moving up under load,
+            #     require two confirmed idle episodes before aborting.
+            #     This avoids false aborts from single transient idle bursts
+            #     observed on some desks.
             #   * held-stop: if the desk never starts moving at all and only
             #     emits idle notifications, abort after IDLE_HELD_STOP_LIMIT
             #     idle notifications.  A higher threshold here avoids false
             #     aborts during slow motor spin-up where some TiMotion desks
             #     emit a couple of is_moving=False packets before engaging.
             last_idle_count: int | None = None
+            confirmed_idle_abort_episodes = 0
             idle_baseline = self._idle_notification_count
             moving_baseline = self._moving_notification_count
             idle_held_stop_limit = 5
@@ -493,6 +498,8 @@ class StandUpDeskConnection:
                     or (is_moving and current_direction == direction)
                 ):
                     last_idle_count = self._idle_notification_count
+                if is_moving and current_direction == direction:
+                    confirmed_idle_abort_episodes = 0
                 if last_idle_count is not None:
                     idle_since_motion = (
                         self._idle_notification_count - last_idle_count
@@ -501,6 +508,23 @@ class StandUpDeskConnection:
                         if not await self._idle_abort_confirmed(direction):
                             # Transient idle pulse during normal movement.
                             # Re-arm idle tracking from the latest baseline.
+                            last_idle_count = self._idle_notification_count
+                            continue
+
+                        confirmed_idle_abort_episodes += 1
+                        if (
+                            confirmed_idle_abort_episodes
+                            < IDLE_ABORT_CONFIRMED_EPISODES
+                        ):
+                            _LOGGER.info(
+                                "Panel idle episode confirmed (%d/%d) at "
+                                "%.0f cm; waiting for next episode before "
+                                "aborting (target: %.0f cm)",
+                                confirmed_idle_abort_episodes,
+                                IDLE_ABORT_CONFIRMED_EPISODES,
+                                current_cm,
+                                target_cm,
+                            )
                             last_idle_count = self._idle_notification_count
                             continue
 
@@ -549,7 +573,10 @@ class StandUpDeskConnection:
                     )
                     if progress < HEIGHT_PROGRESS_MIN_CM:
                         low_progress_windows += 1
-                        if low_progress_windows >= HEIGHT_PROGRESS_FAIL_WINDOWS:
+                        if (
+                            low_progress_windows
+                            >= HEIGHT_PROGRESS_FAIL_WINDOWS
+                        ):
                             _LOGGER.warning(
                                 "Height stuck (%.1f cm progress towards "
                                 "target in 3 s, %d consecutive windows); "

@@ -468,6 +468,93 @@ class TransientIdlePulseClient(FakeClient):
         }
 
 
+class SingleConfirmedIdleEpisodeThenResumeClient(FakeClient):
+    """Simulates one confirmed idle episode followed by normal UP movement.
+
+    The desk emits two idle notifications (enough for one confirmed
+    idle-episode) and then resumes moving up. Movement must continue and
+    reach target; a single confirmed idle episode must not trigger abort.
+    """
+
+    def __init__(self, conn):
+        """Initialize client with attached connection."""
+        super().__init__()
+        self.conn = conn
+        self._up_count = 0
+        self._episode_emitted = False
+
+    async def write_gatt_char(self, _uuid, command, response=False):
+        """Emit one two-idle episode, then resume normal up movement."""
+        await super().write_gatt_char(_uuid, command, response=response)
+        if command != standup_desk.UP_COMMAND:
+            return
+
+        self._up_count += 1
+
+        if self._up_count <= 2:
+            self.conn._notification_count += 1
+            self.conn._moving_notification_count += 1
+            self.conn.current_status = {
+                "height_cm": 80.0 + self._up_count * 2.5,
+                "is_moving": True,
+                "direction": "up",
+            }
+            return
+
+        if not self._episode_emitted:
+            self._episode_emitted = True
+            # First idle packet.
+            self.conn._notification_count += 1
+            self.conn._idle_notification_count += 1
+            self.conn.current_status = {
+                "height_cm": 85.0,
+                "is_moving": False,
+                "direction": "idle",
+            }
+            panel_idle_event = getattr(self.conn, "_panel_idle_event", None)
+            if panel_idle_event is not None:
+                panel_idle_event.set()
+
+            async def _second_idle_then_resume() -> None:
+                # Emit second idle shortly after the first so one confirmed
+                # idle episode is formed, then resume UP movement.
+                await asyncio.sleep(0.05)
+                self.conn._notification_count += 1
+                self.conn._idle_notification_count += 1
+                self.conn.current_status = {
+                    "height_cm": 85.0,
+                    "is_moving": False,
+                    "direction": "idle",
+                }
+                panel_idle_event2 = getattr(
+                    self.conn,
+                    "_panel_idle_event",
+                    None,
+                )
+                if panel_idle_event2 is not None:
+                    panel_idle_event2.set()
+
+                await asyncio.sleep(0.1)
+                self.conn._notification_count += 1
+                self.conn._moving_notification_count += 1
+                self.conn.current_status = {
+                    "height_cm": 87.5,
+                    "is_moving": True,
+                    "direction": "up",
+                }
+
+            asyncio.create_task(_second_idle_then_resume())
+            return
+
+        self.conn._notification_count += 1
+        self.conn._moving_notification_count += 1
+        self.conn.current_status = {
+            "height_cm": 87.5 + (self._up_count - 3) * 2.5,
+            "is_moving": True,
+            "direction": "up",
+        }
+
+
 class FakeHass:
     """Minimal Home Assistant stub for async task scheduling."""
 
@@ -737,13 +824,13 @@ class MovementRecoveryTests(unittest.IsolatedAsyncioTestCase):
         ]
         self.assertLessEqual(
             len(move_commands),
-            3,
+            5,
             (
-                "Movement must abort within 3 UP commands when the physical "
-                "panel STOP repeatedly interrupts HA UP commands — the "
-                "idle-threshold check fires after persistent idleness so "
-                "HA quickly stops sending UP commands that could interfere "
-                "with a panel-preset move the desk may be transitioning to."
+                "Movement must abort within 5 UP commands when the physical "
+                "panel STOP repeatedly interrupts HA UP commands — one "
+                "confirmed idle episode is tolerated to avoid false "
+                "positives, the second confirmed episode aborts quickly so "
+                "HA still avoids interfering with panel input."
             ),
         )
 
@@ -996,6 +1083,36 @@ class MovementRecoveryTests(unittest.IsolatedAsyncioTestCase):
             fake_client.disconnect_calls,
             0,
             "Transient idle pulse must not trigger panel-interrupt "
+            "BLE release.",
+        )
+
+    async def test_single_confirmed_idle_episode_allows_up_recovery(self):
+        """One confirmed idle episode must not abort normal UP movement."""
+        setattr(standup_desk, "MOVEMENT_INTERVAL", 0.05)
+        setattr(standup_desk, "MAX_MOVEMENT_STEPS", 60)
+
+        conn = StandUpDeskConnection("AA:BB", cast(Any, FakeHass()))
+        fake_client = SingleConfirmedIdleEpisodeThenResumeClient(conn)
+        conn.client = cast(Any, fake_client)
+        conn.is_connected = True
+        conn.current_status = {
+            "height_cm": 80,
+            "is_moving": False,
+            "direction": "idle",
+        }
+
+        await conn.move_to_height(120, "up")
+
+        self.assertGreaterEqual(
+            conn.current_status.get("height_cm", 0),
+            117,
+            "Desk should still reach target after one confirmed idle "
+            "episode followed by resumed upward movement.",
+        )
+        self.assertEqual(
+            fake_client.disconnect_calls,
+            0,
+            "Single confirmed idle episode must not trigger panel-interrupt "
             "BLE release.",
         )
 
