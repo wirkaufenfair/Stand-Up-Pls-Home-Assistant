@@ -57,6 +57,7 @@ IDLE_ABORT_CONFIRM_INTERVAL = 0.05
 IDLE_ABORT_MIN_IDLE_NOTIFICATIONS = 2
 IDLE_ABORT_CONFIRMED_EPISODES = 2
 HEIGHT_PROGRESS_FAIL_WINDOWS = 2
+UP_SLOW_PROGRESS_GRACE_WINDOWS = 1
 
 
 def decode_desk_status(data: bytes) -> dict[str, Any] | None:
@@ -346,6 +347,7 @@ class StandUpDeskConnection:
             height_checkpoint = start_cm
             height_check_step = 0
             low_progress_windows = 0
+            up_slow_progress_grace_used = 0
             # Panel-stop detection has two modes:
             #   * post-motion: once the desk confirms it has started moving
             #     (a fresh is_moving=True notification, or current_status
@@ -564,6 +566,9 @@ class StandUpDeskConnection:
                 # Threshold: 2.0 cm — catches slow tug-of-war (0.1 cm/step
                 # × 15 steps = 1.5 cm) while allowing normal TiMotion
                 # movement (≥ 2.5 cm/s × 3 s = 7.5 cm).
+                # Some desks climb slowly for the first few seconds while
+                # lifting under load, so allow one low-progress UP window as
+                # long as there is still measurable forward progress.
                 height_check_step += 1
                 if height_check_step >= 15:
                     progress = (
@@ -572,6 +577,26 @@ class StandUpDeskConnection:
                         else height_checkpoint - current_cm
                     )
                     if progress < HEIGHT_PROGRESS_MIN_CM:
+                        if (
+                            direction == "up"
+                            and progress > 0
+                            and up_slow_progress_grace_used
+                            < UP_SLOW_PROGRESS_GRACE_WINDOWS
+                        ):
+                            up_slow_progress_grace_used += 1
+                            _LOGGER.info(
+                                "Slow upward progress tolerated (%d/%d): "
+                                "%.1f cm towards target in 3 s at %.0f cm "
+                                "(target: %.0f cm)",
+                                up_slow_progress_grace_used,
+                                UP_SLOW_PROGRESS_GRACE_WINDOWS,
+                                progress,
+                                current_cm,
+                                target_cm,
+                            )
+                            height_checkpoint = current_cm
+                            height_check_step = 0
+                            continue
                         low_progress_windows += 1
                         if (
                             low_progress_windows

@@ -555,6 +555,53 @@ class SingleConfirmedIdleEpisodeThenResumeClient(FakeClient):
         }
 
 
+class SlowUpStartupThenRecoverClient(FakeClient):
+    """Simulates slow but real upward movement before normal speed resumes."""
+
+    def __init__(self, conn):
+        """Initialize client with attached connection."""
+        super().__init__()
+        self.conn = conn
+        self._movement_started = False
+        self._task = None
+
+    async def write_gatt_char(self, _uuid, command, response=False):
+        """Start background UP notifications on the first UP command."""
+        await super().write_gatt_char(_uuid, command, response=response)
+        if command != standup_desk.UP_COMMAND or self._movement_started:
+            return
+
+        self._movement_started = True
+
+        async def _emit_progress() -> None:
+            height = 78.0
+            for _ in range(30):
+                # First two 15-step windows: 1.0 cm progress each.
+                height += 1.0 / 15.0
+                self.conn._notification_count += 1
+                self.conn._moving_notification_count += 1
+                self.conn.current_status = {
+                    "height_cm": round(height, 1),
+                    "is_moving": True,
+                    "direction": "up",
+                }
+                await asyncio.sleep(0.01)
+
+            while height < 123.0:
+                # Then resume normal upward speed.
+                height += 0.8
+                self.conn._notification_count += 1
+                self.conn._moving_notification_count += 1
+                self.conn.current_status = {
+                    "height_cm": round(height, 1),
+                    "is_moving": True,
+                    "direction": "up",
+                }
+                await asyncio.sleep(0.01)
+
+        self._task = asyncio.create_task(_emit_progress())
+
+
 class FakeHass:
     """Minimal Home Assistant stub for async task scheduling."""
 
@@ -1114,6 +1161,36 @@ class MovementRecoveryTests(unittest.IsolatedAsyncioTestCase):
             0,
             "Single confirmed idle episode must not trigger panel-interrupt "
             "BLE release.",
+        )
+
+    async def test_slow_upward_startup_does_not_trigger_height_stuck(self):
+        """Slow but real upward progress must get one grace window."""
+        setattr(standup_desk, "MOVEMENT_INTERVAL", 0.01)
+        setattr(standup_desk, "MAX_MOVEMENT_STEPS", 120)
+
+        conn = StandUpDeskConnection("AA:BB", cast(Any, FakeHass()))
+        fake_client = SlowUpStartupThenRecoverClient(conn)
+        conn.client = cast(Any, fake_client)
+        conn.is_connected = True
+        conn.current_status = {
+            "height_cm": 78.0,
+            "is_moving": False,
+            "direction": "idle",
+        }
+
+        await conn.move_to_height(125, "up")
+
+        self.assertGreaterEqual(
+            conn.current_status.get("height_cm", 0),
+            122,
+            "Desk should continue upward after one slow startup window "
+            "instead of tripping the height-stuck abort.",
+        )
+        self.assertEqual(
+            fake_client.disconnect_calls,
+            0,
+            "Slow upward startup must not trigger a panel-interrupt BLE "
+            "release.",
         )
 
 
