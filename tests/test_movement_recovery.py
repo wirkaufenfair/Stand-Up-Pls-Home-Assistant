@@ -602,6 +602,47 @@ class SlowUpStartupThenRecoverClient(FakeClient):
         self._task = asyncio.create_task(_emit_progress())
 
 
+class SustainedSlowContinuousUpClient(FakeClient):
+    """Simulates sustained slow but steady upward movement.
+
+    The desk keeps sending frequent moving/up notifications while only
+    advancing 1.0 cm per 3 s window (15 steps), i.e. below
+    HEIGHT_PROGRESS_MIN_CM (2.0 cm). This is a real slow-load scenario and
+    should not be treated as stuck.
+    """
+
+    def __init__(self, conn):
+        """Initialize client with attached connection."""
+        super().__init__()
+        self.conn = conn
+        self._movement_started = False
+        self._task = None
+
+    async def write_gatt_char(self, _uuid, command, response=False):
+        """Start sustained slow UP notifications on the first UP command."""
+        await super().write_gatt_char(_uuid, command, response=response)
+        if command != standup_desk.UP_COMMAND or self._movement_started:
+            return
+
+        self._movement_started = True
+
+        async def _emit_progress() -> None:
+            height = 80.0
+            # 1.0 cm progress every 15 updates => slow but steady.
+            while height < 85.0:
+                height += 1.0 / 15.0
+                self.conn._notification_count += 1
+                self.conn._moving_notification_count += 1
+                self.conn.current_status = {
+                    "height_cm": round(height, 1),
+                    "is_moving": True,
+                    "direction": "up",
+                }
+                await asyncio.sleep(0.01)
+
+        self._task = asyncio.create_task(_emit_progress())
+
+
 class FakeHass:
     """Minimal Home Assistant stub for async task scheduling."""
 
@@ -1191,6 +1232,38 @@ class MovementRecoveryTests(unittest.IsolatedAsyncioTestCase):
             0,
             "Slow upward startup must not trigger a panel-interrupt BLE "
             "release.",
+        )
+
+    async def test_sustained_slow_upward_progress_does_not_false_abort(
+        self,
+    ):
+        """Continuous slow UP movement must not trip height-stuck abort."""
+        setattr(standup_desk, "MOVEMENT_INTERVAL", 0.01)
+        setattr(standup_desk, "MAX_MOVEMENT_STEPS", 160)
+
+        conn = StandUpDeskConnection("AA:BB", cast(Any, FakeHass()))
+        fake_client = SustainedSlowContinuousUpClient(conn)
+        conn.client = cast(Any, fake_client)
+        conn.is_connected = True
+        conn.current_status = {
+            "height_cm": 80.0,
+            "is_moving": False,
+            "direction": "idle",
+        }
+
+        await conn.move_to_height(85, "up")
+
+        self.assertGreaterEqual(
+            conn.current_status.get("height_cm", 0),
+            82,
+            "Desk should keep moving upward during sustained slow but "
+            "continuous motion instead of aborting as height-stuck.",
+        )
+        self.assertEqual(
+            fake_client.disconnect_calls,
+            0,
+            "Sustained slow upward motion must not trigger panel-interrupt "
+            "BLE release.",
         )
 
 

@@ -58,6 +58,7 @@ IDLE_ABORT_MIN_IDLE_NOTIFICATIONS = 2
 IDLE_ABORT_CONFIRMED_EPISODES = 2
 HEIGHT_PROGRESS_FAIL_WINDOWS = 2
 UP_SLOW_PROGRESS_GRACE_WINDOWS = 1
+UP_STEADY_PROGRESS_MIN_MOVING_UPDATES = 10
 
 
 def decode_desk_status(data: bytes) -> dict[str, Any] | None:
@@ -348,6 +349,7 @@ class StandUpDeskConnection:
             height_check_step = 0
             low_progress_windows = 0
             up_slow_progress_grace_used = 0
+            moving_updates_in_window = 0
             # Panel-stop detection has two modes:
             #   * post-motion: once the desk confirms it has started moving
             #     (a fresh is_moving=True notification, or current_status
@@ -441,6 +443,12 @@ class StandUpDeskConnection:
 
                 received_update = self._notification_count != last_notif_count
                 last_notif_count = self._notification_count
+                if (
+                    received_update
+                    and is_moving
+                    and current_direction == direction
+                ):
+                    moving_updates_in_window += 1
                 # Stall detection: only fire when the desk is completely
                 # silent — no BLE notification arrived this step.  As long
                 # as the desk sends *any* packet (is_moving=True, idle, or
@@ -580,6 +588,26 @@ class StandUpDeskConnection:
                         if (
                             direction == "up"
                             and progress > 0
+                            and moving_updates_in_window
+                            >= UP_STEADY_PROGRESS_MIN_MOVING_UPDATES
+                        ):
+                            _LOGGER.info(
+                                "Slow but steady upward progress accepted: "
+                                "%.1f cm towards target in 3 s with %d "
+                                "moving updates at %.0f cm (target: %.0f cm)",
+                                progress,
+                                moving_updates_in_window,
+                                current_cm,
+                                target_cm,
+                            )
+                            low_progress_windows = 0
+                            height_checkpoint = current_cm
+                            height_check_step = 0
+                            moving_updates_in_window = 0
+                            continue
+                        if (
+                            direction == "up"
+                            and progress > 0
                             and up_slow_progress_grace_used
                             < UP_SLOW_PROGRESS_GRACE_WINDOWS
                         ):
@@ -596,6 +624,7 @@ class StandUpDeskConnection:
                             )
                             height_checkpoint = current_cm
                             height_check_step = 0
+                            moving_updates_in_window = 0
                             continue
                         low_progress_windows += 1
                         if (
@@ -616,6 +645,7 @@ class StandUpDeskConnection:
                         low_progress_windows = 0
                     height_checkpoint = current_cm
                     height_check_step = 0
+                    moving_updates_in_window = 0
 
                 # While the desk reports active motion in the requested
                 # direction AND we keep receiving fresh notifications,
