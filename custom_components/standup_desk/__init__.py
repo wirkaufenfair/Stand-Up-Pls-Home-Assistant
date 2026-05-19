@@ -58,6 +58,7 @@ IDLE_ABORT_CONFIRM_INTERVAL = 0.05
 IDLE_ABORT_MIN_IDLE_NOTIFICATIONS = 2
 IDLE_ABORT_CONFIRMED_EPISODES = 2
 IDLE_ABORT_RESUME_GRACE_STEPS = 4
+IDLE_ABORT_POST_EPISODE_SILENCE_GRACE_STEPS = 10
 PANEL_HANDOFF_COOLDOWN_SECONDS = 3.0
 PANEL_HANDOFF_DISCONNECT_DELAY = 1.0
 HEIGHT_PROGRESS_FAIL_WINDOWS = 2
@@ -525,6 +526,7 @@ class StandUpDeskConnection:
             idle_baseline = self._idle_notification_count
             moving_baseline = self._moving_notification_count
             idle_held_stop_limit = 5
+            post_idle_episode_silence_steps = 0
             # Set to True only when the panel is actively executing a preset
             # move in the *opposite* direction.  In that case the final STOP
             # must be skipped because the desk is mid-preset and a spurious
@@ -628,8 +630,17 @@ class StandUpDeskConnection:
                     # the stall counter.
                     startup_grace_steps = 0
                     stalled_steps = 0
+                    post_idle_episode_silence_steps = 0
                 else:
                     # Post-grace silence: desk stopped sending notifications.
+                    if (
+                        confirmed_idle_abort_episodes > 0
+                        and post_idle_episode_silence_steps
+                        < IDLE_ABORT_POST_EPISODE_SILENCE_GRACE_STEPS
+                    ):
+                        post_idle_episode_silence_steps += 1
+                        stalled_steps = 0
+                        continue
                     stalled_steps += 1
                     if stalled_steps >= MAX_STALL_STEPS:
                         # If we already saw at least one idle notification
@@ -641,6 +652,8 @@ class StandUpDeskConnection:
                             last_idle_count is not None
                             and self._idle_notification_count > last_idle_count
                         ):
+                            idle_abort = True
+                        elif confirmed_idle_abort_episodes > 0:
                             idle_abort = True
                         _LOGGER.warning(
                             "Movement aborted after %d stalled updates at "
@@ -675,16 +688,19 @@ class StandUpDeskConnection:
                 ):
                     idle_resume_grace_steps += 1
                     if idle_resume_grace_steps >= IDLE_ABORT_RESUME_GRACE_STEPS:
-                        _LOGGER.warning(
-                            "Panel stop detected: desk stayed idle after "
-                            "one confirmed idle episode; aborting at %.0f "
-                            "cm (target: %.0f cm, %s)",
+                        _LOGGER.info(
+                            "Desk remained idle after one confirmed idle "
+                            "episode; continuing observation and requiring "
+                            "a second confirmed episode before aborting at "
+                            "%.0f cm (target: %.0f cm, %s)",
                             current_cm,
                             target_cm,
                             self._state_snapshot(),
                         )
-                        idle_abort = True
-                        break
+                        waiting_for_motion_after_idle_episode = False
+                        idle_resume_grace_steps = 0
+                        last_idle_count = self._idle_notification_count
+                        continue
                     # After one confirmed idle episode, stop issuing further
                     # move commands for a short grace period and only observe
                     # whether the desk resumes on its own. Continuing to send
@@ -889,6 +905,24 @@ class StandUpDeskConnection:
             #   some TiMotion firmware revisions lock up if HA performs GATT
             #   operations right after a physical panel interaction.
             # * all other exits: send STOP to cleanly reset firmware state.
+            if (
+                not target_reached
+                and not opposite_dir_abort
+                and not idle_abort
+                and confirmed_idle_abort_episodes > 0
+                and self.current_status.get("direction", "idle") == "idle"
+                and not self.current_status.get("is_moving", False)
+            ):
+                _LOGGER.warning(
+                    "Panel stop detected: desk remained idle after confirmed "
+                    "idle episode(s); treating as panel handoff at %.0f cm "
+                    "(target: %.0f cm, %s)",
+                    self.current_status.get("height_cm", last_cm),
+                    target_cm,
+                    self._state_snapshot(),
+                )
+                idle_abort = True
+
             skip_final_stop = opposite_dir_abort or idle_abort
 
             if not skip_final_stop and self.client and self.is_connected:

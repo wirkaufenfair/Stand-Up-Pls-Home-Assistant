@@ -644,6 +644,94 @@ class ConfirmedIdleStretchThenResumeClient(FakeClient):
         }
 
 
+class OneIdleEpisodeLongPauseThenResumeClient(FakeClient):
+    """Simulates one confirmed idle episode, then a longer quiet pause.
+
+    Regression: after exactly one confirmed idle episode, the loop enters a
+    short observe-only grace. A longer but recoverable pause must not be
+    interpreted as an immediate panel stop; movement should continue once
+    upward notifications resume.
+    """
+
+    def __init__(self, conn):
+        """Initialize client with attached connection."""
+        super().__init__()
+        self.conn = conn
+        self._up_count = 0
+        self._episode_emitted = False
+
+    async def write_gatt_char(self, _uuid, command, response=False):
+        """Emit one confirmed idle episode, then resume after quiet pause."""
+        await super().write_gatt_char(_uuid, command, response=response)
+        if command != standup_desk.UP_COMMAND:
+            return
+
+        self._up_count += 1
+
+        if self._up_count <= 2:
+            self.conn._notification_count += 1
+            self.conn._moving_notification_count += 1
+            self.conn.current_status = {
+                "height_cm": 80.0 + self._up_count * 2.5,
+                "is_moving": True,
+                "direction": "up",
+            }
+            return
+
+        if not self._episode_emitted:
+            self._episode_emitted = True
+            # Form one confirmed idle episode (two idle notifications).
+            self.conn._notification_count += 1
+            self.conn._idle_notification_count += 1
+            self.conn.current_status = {
+                "height_cm": 85.0,
+                "is_moving": False,
+                "direction": "idle",
+            }
+            panel_idle_event = getattr(self.conn, "_panel_idle_event", None)
+            if panel_idle_event is not None:
+                panel_idle_event.set()
+
+            async def _second_idle_then_late_resume() -> None:
+                await asyncio.sleep(0.05)
+                self.conn._notification_count += 1
+                self.conn._idle_notification_count += 1
+                self.conn.current_status = {
+                    "height_cm": 85.0,
+                    "is_moving": False,
+                    "direction": "idle",
+                }
+                panel_idle_event2 = getattr(
+                    self.conn,
+                    "_panel_idle_event",
+                    None,
+                )
+                if panel_idle_event2 is not None:
+                    panel_idle_event2.set()
+
+                # Pause longer than 4 * MOVEMENT_INTERVAL when tests run
+                # with MOVEMENT_INTERVAL=0.05 (grace ~= 0.2 s), then resume.
+                await asyncio.sleep(0.35)
+                self.conn._notification_count += 1
+                self.conn._moving_notification_count += 1
+                self.conn.current_status = {
+                    "height_cm": 87.5,
+                    "is_moving": True,
+                    "direction": "up",
+                }
+
+            asyncio.create_task(_second_idle_then_late_resume())
+            return
+
+        self.conn._notification_count += 1
+        self.conn._moving_notification_count += 1
+        self.conn.current_status = {
+            "height_cm": 87.5 + (self._up_count - 3) * 2.5,
+            "is_moving": True,
+            "direction": "up",
+        }
+
+
 class SlowUpStartupThenRecoverClient(FakeClient):
     """Simulates slow but real upward movement before normal speed resumes."""
 
@@ -1356,6 +1444,36 @@ class MovementRecoveryTests(unittest.IsolatedAsyncioTestCase):
             0,
             "One sustained idle stretch must not trigger panel-interrupt "
             "BLE release.",
+        )
+
+    async def test_one_episode_long_pause_then_resume_does_not_abort(self):
+        """One confirmed idle episode plus long pause must still recover."""
+        setattr(standup_desk, "MOVEMENT_INTERVAL", 0.05)
+        setattr(standup_desk, "MAX_MOVEMENT_STEPS", 80)
+
+        conn = StandUpDeskConnection("AA:BB", cast(Any, FakeHass()))
+        fake_client = OneIdleEpisodeLongPauseThenResumeClient(conn)
+        conn.client = cast(Any, fake_client)
+        conn.is_connected = True
+        conn.current_status = {
+            "height_cm": 80,
+            "is_moving": False,
+            "direction": "idle",
+        }
+
+        await conn.move_to_height(120, "up")
+
+        self.assertGreaterEqual(
+            conn.current_status.get("height_cm", 0),
+            117,
+            "Desk should still reach target after one confirmed idle "
+            "episode followed by a longer pause and resumed upward movement.",
+        )
+        self.assertEqual(
+            fake_client.disconnect_calls,
+            0,
+            "One confirmed idle episode with a longer pause must not trigger "
+            "panel-interrupt BLE release.",
         )
 
     async def test_slow_upward_startup_does_not_trigger_height_stuck(self):

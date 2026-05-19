@@ -112,6 +112,14 @@ automation:
 - **Connection fails:** The desk can only maintain one BLE connection at a time. Close the "Stand Up Pls" app on your phone before connecting via Home Assistant.
 - **Height readings inaccurate:** The desk reports height relative to its internal calibration. Small offsets are normal.
 
+## Changelog
+
+### 1.0.35
+
+- Improved movement stability for upward runs when a single idle episode occurs during load.
+- Reduced false-positive panel-stop aborts that could stop movement early (e.g. around mid-height).
+- Added regression coverage for "single idle episode + longer pause + resume" recovery behavior.
+
 ## License
 
 This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
