@@ -555,6 +555,95 @@ class SingleConfirmedIdleEpisodeThenResumeClient(FakeClient):
         }
 
 
+class ConfirmedIdleStretchThenResumeClient(FakeClient):
+    """Simulates one sustained idle stretch that later resumes upward.
+
+    Regression: one continuous pause can emit several idle notifications.
+    That must count as a single idle episode, not as multiple episodes that
+    falsely trigger the panel-stop abort while the desk is merely pausing
+    under load before resuming upward movement.
+    """
+
+    def __init__(self, conn):
+        """Initialize client with attached connection."""
+        super().__init__()
+        self.conn = conn
+        self._up_count = 0
+        self._stretch_emitted = False
+
+    async def write_gatt_char(self, _uuid, command, response=False):
+        """Emit one long idle stretch with repeated idle notifications."""
+        await super().write_gatt_char(_uuid, command, response=response)
+        if command != standup_desk.UP_COMMAND:
+            return
+
+        self._up_count += 1
+
+        if self._up_count <= 2:
+            self.conn._notification_count += 1
+            self.conn._moving_notification_count += 1
+            self.conn.current_status = {
+                "height_cm": 80.0 + self._up_count * 2.5,
+                "is_moving": True,
+                "direction": "up",
+            }
+            return
+
+        if not self._stretch_emitted:
+            self._stretch_emitted = True
+            self.conn._notification_count += 1
+            self.conn._idle_notification_count += 1
+            self.conn.current_status = {
+                "height_cm": 85.0,
+                "is_moving": False,
+                "direction": "idle",
+            }
+            panel_idle_event = getattr(self.conn, "_panel_idle_event", None)
+            if panel_idle_event is not None:
+                panel_idle_event.set()
+
+            async def _emit_idle_stretch_then_resume() -> None:
+                for _ in range(3):
+                    await asyncio.sleep(0.1)
+                    self.conn._notification_count += 1
+                    self.conn._idle_notification_count += 1
+                    self.conn.current_status = {
+                        "height_cm": 85.0,
+                        "is_moving": False,
+                        "direction": "idle",
+                    }
+                    panel_idle_event2 = getattr(
+                        self.conn,
+                        "_panel_idle_event",
+                        None,
+                    )
+                    if panel_idle_event2 is not None:
+                        panel_idle_event2.set()
+
+                # Resume only after the 500 ms idle-confirmation window has
+                # already elapsed so this exercises the post-confirmation
+                # resume grace rather than the transient-idle path.
+                await asyncio.sleep(0.35)
+                self.conn._notification_count += 1
+                self.conn._moving_notification_count += 1
+                self.conn.current_status = {
+                    "height_cm": 87.5,
+                    "is_moving": True,
+                    "direction": "up",
+                }
+
+            asyncio.create_task(_emit_idle_stretch_then_resume())
+            return
+
+        self.conn._notification_count += 1
+        self.conn._moving_notification_count += 1
+        self.conn.current_status = {
+            "height_cm": 87.5 + (self._up_count - 3) * 2.5,
+            "is_moving": True,
+            "direction": "up",
+        }
+
+
 class SlowUpStartupThenRecoverClient(FakeClient):
     """Simulates slow but real upward movement before normal speed resumes."""
 
@@ -912,13 +1001,14 @@ class MovementRecoveryTests(unittest.IsolatedAsyncioTestCase):
         ]
         self.assertLessEqual(
             len(move_commands),
-            5,
+            6,
             (
-                "Movement must abort within 5 UP commands when the physical "
-                "panel STOP repeatedly interrupts HA UP commands — one "
-                "confirmed idle episode is tolerated to avoid false "
-                "positives, the second confirmed episode aborts quickly so "
-                "HA still avoids interfering with panel input."
+                "Movement must still abort within a few UP commands when "
+                "the physical panel STOP repeatedly interrupts HA UP "
+                "commands. One confirmed idle episode plus a short resume "
+                "grace is tolerated to avoid false positives from a single "
+                "long pause, but HA should still back off quickly enough to "
+                "avoid interfering with panel input."
             ),
         )
 
@@ -1022,27 +1112,31 @@ class MovementRecoveryTests(unittest.IsolatedAsyncioTestCase):
             "Movement loop must abort within a few steps when the desk "
             "reports opposite direction after a panel preset press.",
         )
-        self.assertGreaterEqual(
+        self.assertEqual(
             fake_client.disconnect_calls,
-            1,
-            "BLE connection must be released after opposite-direction "
-            "panel interrupt so the panel can take over reliably.",
+            0,
+            "No immediate disconnect should be attempted during panel "
+            "preset handoff; immediate GATT teardown can lock the desk.",
+        )
+        self.assertIsNone(
+            conn.client,
+            "Connection should be quarantined locally after panel preset "
+            "handoff so HA stops using the live BLE link immediately.",
         )
 
     async def test_panel_button_stop_no_final_stop_for_safety(
         self,
     ):
-        """Idle-abort must skip STOP and disconnect without stop_notify.
+        """Idle-abort must skip STOP and avoid immediate BLE teardown.
 
         Regression: when a panel button stops movement (idle), we cannot
         reliably distinguish between a simple stop vs. a preset that is about
         to start. To avoid cancelling a delayed preset, idle-abort never sends
-        final STOP. At the same time, keeping BLE connected for too long can
-        leave panel control blocked; we must release BLE promptly.
+        final STOP. Immediate disconnect is also unsafe on some desks, so the
+        connection must be quarantined locally first and only released later.
 
-        Critical detail: release must be a direct disconnect without a prior
-        stop_notify call, because stop_notify during panel transitions can
-        lock TiMotion firmware.
+        Critical detail: no immediate stop_notify/disconnect call is allowed,
+        because panel-transition firmware can lock hard in that window.
         """
         setattr(standup_desk, "MOVEMENT_INTERVAL", 0)
         setattr(standup_desk, "MAX_MOVEMENT_STEPS", 20)
@@ -1078,11 +1172,11 @@ class MovementRecoveryTests(unittest.IsolatedAsyncioTestCase):
             "No final STOP must be sent after idle-abort to avoid "
             "cancelling potential panel presets.",
         )
-        self.assertGreaterEqual(
+        self.assertEqual(
             fake_client.disconnect_calls,
-            1,
-            "BLE should be disconnected on idle-abort so panel control can "
-            "recover immediately.",
+            0,
+            "Idle-abort must not attempt immediate disconnect during the "
+            "panel-handoff window.",
         )
         self.assertEqual(
             fake_client.stop_notify_calls,
@@ -1090,15 +1184,32 @@ class MovementRecoveryTests(unittest.IsolatedAsyncioTestCase):
             "Idle-abort release must not call stop_notify because that can "
             "lock TiMotion firmware during panel transitions.",
         )
+        self.assertIsNone(
+            conn.client,
+            "Idle-abort should quarantine the client locally so HA does not "
+            "keep driving the live BLE link after panel input.",
+        )
+        move_commands = [
+            cmd
+            for cmd in fake_client.commands
+            if cmd == standup_desk.UP_COMMAND
+        ]
+        self.assertLessEqual(
+            len(move_commands),
+            5,
+            "After a confirmed idle episode from a panel stop, HA must stop "
+            "sending further UP commands quickly so BLE control is released "
+            "instead of fighting the panel.",
+        )
 
     async def test_idle_abort_with_delayed_preset_transition_sends_no_stop(
         self,
     ):
-        """No STOP and disconnect-without-stop_notify after idle-abort.
+        """No STOP and no immediate disconnect during idle-abort handoff.
 
         stop_notify during an active panel preset transition can lock the
-        TiMotion firmware. We therefore allow BLE release only via direct
-        disconnect.
+        TiMotion firmware. We therefore quarantine the connection locally and
+        delay any teardown/reconnect attempts until after a cooldown.
         """
         setattr(standup_desk, "MOVEMENT_INTERVAL", 0)
         setattr(standup_desk, "MAX_MOVEMENT_STEPS", 20)
@@ -1131,16 +1242,27 @@ class MovementRecoveryTests(unittest.IsolatedAsyncioTestCase):
             "No final STOP must be sent when idle-abort transitions into "
             "panel-controlled preset motion.",
         )
-        self.assertGreaterEqual(
+        self.assertEqual(
             fake_client.disconnect_calls,
-            1,
-            "Idle-abort should release BLE control via direct disconnect.",
+            0,
+            "Idle-abort must not attempt an immediate disconnect during a "
+            "potential preset transition window.",
         )
         self.assertEqual(
             fake_client.stop_notify_calls,
             0,
             "Idle-abort release must not call stop_notify because that can "
             "lock TiMotion firmware during panel transitions.",
+        )
+        self.assertIsNone(
+            conn.client,
+            "Idle-abort should quarantine the client locally so HA stops "
+            "touching the live BLE link during preset handoff.",
+        )
+        self.assertFalse(
+            await conn.ensure_connected(),
+            "Reconnect attempts should be blocked briefly after panel "
+            "handoff to avoid another immediate STOP-based handshake.",
         )
 
     async def test_transient_idle_pulse_does_not_abort_normal_up_movement(
@@ -1201,6 +1323,38 @@ class MovementRecoveryTests(unittest.IsolatedAsyncioTestCase):
             fake_client.disconnect_calls,
             0,
             "Single confirmed idle episode must not trigger panel-interrupt "
+            "BLE release.",
+        )
+
+    async def test_long_idle_stretch_counts_as_single_episode_then_recovers(
+        self,
+    ):
+        """One long idle stretch must not be double-counted as two episodes."""
+        setattr(standup_desk, "MOVEMENT_INTERVAL", 0.05)
+        setattr(standup_desk, "MAX_MOVEMENT_STEPS", 60)
+
+        conn = StandUpDeskConnection("AA:BB", cast(Any, FakeHass()))
+        fake_client = ConfirmedIdleStretchThenResumeClient(conn)
+        conn.client = cast(Any, fake_client)
+        conn.is_connected = True
+        conn.current_status = {
+            "height_cm": 80,
+            "is_moving": False,
+            "direction": "idle",
+        }
+
+        await conn.move_to_height(120, "up")
+
+        self.assertGreaterEqual(
+            conn.current_status.get("height_cm", 0),
+            117,
+            "Desk should recover after one sustained idle stretch that "
+            "later resumes upward movement.",
+        )
+        self.assertEqual(
+            fake_client.disconnect_calls,
+            0,
+            "One sustained idle stretch must not trigger panel-interrupt "
             "BLE release.",
         )
 

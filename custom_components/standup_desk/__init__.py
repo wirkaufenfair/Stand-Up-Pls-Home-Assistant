@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from time import monotonic
 from typing import Any
 
 from bleak import BleakClient
@@ -56,6 +57,9 @@ IDLE_ABORT_CONFIRM_STEPS = 10
 IDLE_ABORT_CONFIRM_INTERVAL = 0.05
 IDLE_ABORT_MIN_IDLE_NOTIFICATIONS = 2
 IDLE_ABORT_CONFIRMED_EPISODES = 2
+IDLE_ABORT_RESUME_GRACE_STEPS = 4
+PANEL_HANDOFF_COOLDOWN_SECONDS = 3.0
+PANEL_HANDOFF_DISCONNECT_DELAY = 1.0
 HEIGHT_PROGRESS_FAIL_WINDOWS = 2
 UP_SLOW_PROGRESS_GRACE_WINDOWS = 1
 UP_STEADY_PROGRESS_MIN_MOVING_UPDATES = 10
@@ -116,15 +120,51 @@ class StandUpDeskConnection:
         self._idle_notification_count: int = 0
         self._moving_notification_count: int = 0
         self._expecting_disconnect: bool = False
+        self._panel_handoff_cooldown_until: float = 0.0
+        self._skip_status_request_once: bool = False
+        self._panel_handoff_disconnect_task: asyncio.Task | None = None
         # Set by _notification_handler on every idle packet so the
         # movement loop can wake from its sleep immediately instead
         # of waiting up to MOVEMENT_INTERVAL before releasing BLE.
         self._panel_idle_event: asyncio.Event = asyncio.Event()
 
+    def _state_snapshot(self) -> str:
+        """Return a compact diagnostic snapshot for movement/handoff logs."""
+        status = self.current_status or {}
+        cooldown_remaining = max(
+            0.0,
+            self._panel_handoff_cooldown_until - monotonic(),
+        )
+        disconnect_pending = (
+            self._panel_handoff_disconnect_task is not None
+            and not self._panel_handoff_disconnect_task.done()
+        )
+        return (
+            "height={height:.1f} direction={direction} moving={moving} "
+            "connected={connected} stop_requested={stop_requested} "
+            "notif={notif} idle_notif={idle_notif} moving_notif={moving_notif} "
+            "cooldown={cooldown:.2f}s delayed_disconnect={disconnect_pending}"
+        ).format(
+            height=float(status.get("height_cm", 0.0)),
+            direction=status.get("direction", "unknown"),
+            moving=status.get("is_moving", False),
+            connected=self.is_connected,
+            stop_requested=self._stop_requested,
+            notif=self._notification_count,
+            idle_notif=self._idle_notification_count,
+            moving_notif=self._moving_notification_count,
+            cooldown=cooldown_remaining,
+            disconnect_pending=disconnect_pending,
+        )
+
     async def connect(self) -> bool:
         """Open the BLE connection and subscribe to desk updates."""
         try:
-            _LOGGER.info("Connecting to desk: %s", self.mac_address)
+            _LOGGER.info(
+                "Connecting to desk: %s (%s)",
+                self.mac_address,
+                self._state_snapshot(),
+            )
             ble_device = async_ble_device_from_address(
                 self.hass,
                 self.mac_address,
@@ -147,10 +187,38 @@ class StandUpDeskConnection:
             )
 
             # Ask desk for a fresh status packet right after subscribing.
-            try:
-                await self.request_status()
-            except BLE_EXCEPTIONS as error:
-                _LOGGER.debug("Initial status request failed: %s", error)
+            # After a physical panel handoff, skip this once because the
+            # status request is implemented as a STOP frame and some TiMotion
+            # firmware revisions dislike an immediate BLE STOP right after a
+            # panel interaction.
+            # Cancel any stale panel-handoff disconnect task now that we
+            # have a fresh connection.  The old client object was already
+            # decoupled from self.client, so its disconnect would target the
+            # desk while our new session is already live — avoid that.
+            if (
+                self._panel_handoff_disconnect_task
+                and not self._panel_handoff_disconnect_task.done()
+            ):
+                _LOGGER.debug(
+                    "Cancelling stale panel-handoff disconnect after reconnect "
+                    "(%s)",
+                    self._state_snapshot(),
+                )
+                self._panel_handoff_disconnect_task.cancel()
+                self._panel_handoff_disconnect_task = None
+
+            if self._skip_status_request_once:
+                self._skip_status_request_once = False
+                _LOGGER.info(
+                    "Skipping initial status request after panel handoff "
+                    "(%s)",
+                    self._state_snapshot(),
+                )
+            else:
+                try:
+                    await self.request_status()
+                except BLE_EXCEPTIONS as error:
+                    _LOGGER.debug("Initial status request failed: %s", error)
 
             self.is_connected = True
             _LOGGER.info("Connected to desk")
@@ -162,6 +230,16 @@ class StandUpDeskConnection:
 
     async def disconnect(self) -> None:
         """Close the BLE connection and stop desk notifications."""
+        if (
+            self._panel_handoff_disconnect_task
+            and not self._panel_handoff_disconnect_task.done()
+        ):
+            _LOGGER.debug(
+                "Cancelling delayed panel-handoff disconnect (%s)",
+                self._state_snapshot(),
+            )
+            self._panel_handoff_disconnect_task.cancel()
+            self._panel_handoff_disconnect_task = None
         if self.client and self.is_connected:
             try:
                 self._expecting_disconnect = True
@@ -173,23 +251,29 @@ class StandUpDeskConnection:
                 self.is_connected = False
                 self._expecting_disconnect = False
 
-    async def _disconnect_without_stop_notify(self, reason: str) -> None:
+    async def _disconnect_without_stop_notify(
+        self,
+        reason: str,
+        client: BleakClient | None = None,
+    ) -> None:
         """Disconnect BLE link without sending stop_notify first.
 
         Some TiMotion firmware revisions can lock panel control when
         stop_notify is sent during a panel preset transition. For panel
         handoff paths we therefore disconnect directly.
         """
-        if not self.client or not self.is_connected:
+        client_to_disconnect = client or self.client
+        if not client_to_disconnect:
             return
 
         try:
             self._expecting_disconnect = True
-            client_any = self.client  # type: Any
+            client_any = client_to_disconnect  # type: Any
             await client_any.disconnect()
             _LOGGER.info(
-                "Released BLE control after panel interrupt (%s)",
+                "Released BLE control after panel interrupt (%s, %s)",
                 reason,
+                self._state_snapshot(),
             )
         except (BleakError, asyncio.TimeoutError, OSError) as error:
             _LOGGER.debug(
@@ -198,21 +282,87 @@ class StandUpDeskConnection:
                 error,
             )
         finally:
-            self.is_connected = False
+            if client is None or client_to_disconnect is self.client:
+                self.is_connected = False
+                self.client = None
             self._expecting_disconnect = False
 
-    async def _release_ble_control_after_panel_interrupt(self) -> None:
-        """Release BLE ownership so the physical panel can fully take over.
+    async def _delayed_panel_handoff_disconnect(
+        self,
+        client: BleakClient,
+        reason: str,
+    ) -> None:
+        """Disconnect old BLE client after a short panel-handoff cooldown."""
+        try:
+            _LOGGER.debug(
+                "Scheduling delayed panel-handoff disconnect in %.2f s "
+                "(%s, %s)",
+                PANEL_HANDOFF_DISCONNECT_DELAY,
+                reason,
+                self._state_snapshot(),
+            )
+            await asyncio.sleep(PANEL_HANDOFF_DISCONNECT_DELAY)
+            _LOGGER.debug(
+                "Running delayed panel-handoff disconnect (%s, %s)",
+                reason,
+                self._state_snapshot(),
+            )
+            await self._disconnect_without_stop_notify(reason, client)
+        except asyncio.CancelledError:
+            _LOGGER.debug(
+                "Cancelled delayed panel-handoff disconnect (%s, %s)",
+                reason,
+                self._state_snapshot(),
+            )
+            raise
 
-        On panel-interrupt abort paths we proactively disconnect BLE so the
-        panel can take over immediately. We intentionally avoid stop_notify
-        here because that GATT operation can lock some TiMotion firmware
-        during panel preset transitions.
+    async def _release_ble_control_after_panel_interrupt(self) -> None:
+        """Quarantine BLE after panel handoff without immediate GATT ops.
+
+        Some desks lock up completely if Home Assistant sends *any* further
+        GATT operation immediately after a physical panel interaction. To be
+        conservative, mark the connection unusable locally right away, avoid
+        the next initial STOP-based status request, and only attempt a raw
+        disconnect after a short cooldown.
         """
-        await self._disconnect_without_stop_notify("panel_interrupt")
+        client = self.client
+        self._stop_requested = True
+        self._skip_status_request_once = True
+        self._panel_handoff_cooldown_until = (
+            monotonic() + PANEL_HANDOFF_COOLDOWN_SECONDS
+        )
+        _LOGGER.warning(
+            "Panel handoff detected; quarantining BLE client for %.1f s and "
+            "skipping next status request (%s)",
+            PANEL_HANDOFF_COOLDOWN_SECONDS,
+            self._state_snapshot(),
+        )
+        self.is_connected = False
+        self.client = None
+        if (
+            self._panel_handoff_disconnect_task
+            and not self._panel_handoff_disconnect_task.done()
+        ):
+            self._panel_handoff_disconnect_task.cancel()
+        if client is not None:
+            self._panel_handoff_disconnect_task = asyncio.create_task(
+                self._delayed_panel_handoff_disconnect(
+                    client,
+                    "panel_interrupt",
+                )
+            )
 
     async def ensure_connected(self) -> bool:
         """Return whether the desk is connected, reconnecting if needed."""
+        cooldown_remaining = self._panel_handoff_cooldown_until - monotonic()
+        if cooldown_remaining > 0:
+            _LOGGER.info(
+                "Delaying BLE reconnect for %.1f s after panel handoff "
+                "(%s)",
+                cooldown_remaining,
+                self._state_snapshot(),
+            )
+            return False
         if self.is_connected:
             return True
         return await self.connect()
@@ -305,7 +455,10 @@ class StandUpDeskConnection:
                 return
 
             if not await self.ensure_connected() or not self.client:
-                _LOGGER.error("Cannot move: not connected")
+                _LOGGER.error(
+                    "Cannot move: not connected (%s)",
+                    self._state_snapshot(),
+                )
                 return
 
             current_cm = self.current_status.get("height_cm", 0)
@@ -367,6 +520,8 @@ class StandUpDeskConnection:
             #     emit a couple of is_moving=False packets before engaging.
             last_idle_count: int | None = None
             confirmed_idle_abort_episodes = 0
+            waiting_for_motion_after_idle_episode = False
+            idle_resume_grace_steps = 0
             idle_baseline = self._idle_notification_count
             moving_baseline = self._moving_notification_count
             idle_held_stop_limit = 5
@@ -419,9 +574,10 @@ class StandUpDeskConnection:
                     opposite_direction_steps += 1
                     _LOGGER.warning(
                         "Movement override detected: desk reports %s "
-                        "while target direction is %s; stopping loop",
+                        "while target direction is %s; stopping loop (%s)",
                         current_direction,
                         direction,
+                        self._state_snapshot(),
                     )
                     opposite_dir_abort = True
                     break
@@ -488,10 +644,11 @@ class StandUpDeskConnection:
                             idle_abort = True
                         _LOGGER.warning(
                             "Movement aborted after %d stalled updates at "
-                            "%.0f cm (target: %.0f cm)",
+                            "%.0f cm (target: %.0f cm, %s)",
                             stalled_steps,
                             current_cm,
                             target_cm,
+                            self._state_snapshot(),
                         )
                         break
 
@@ -510,7 +667,41 @@ class StandUpDeskConnection:
                     last_idle_count = self._idle_notification_count
                 if is_moving and current_direction == direction:
                     confirmed_idle_abort_episodes = 0
-                if last_idle_count is not None:
+                    waiting_for_motion_after_idle_episode = False
+                    idle_resume_grace_steps = 0
+                if (
+                    last_idle_count is not None
+                    and waiting_for_motion_after_idle_episode
+                ):
+                    idle_resume_grace_steps += 1
+                    if idle_resume_grace_steps >= IDLE_ABORT_RESUME_GRACE_STEPS:
+                        _LOGGER.warning(
+                            "Panel stop detected: desk stayed idle after "
+                            "one confirmed idle episode; aborting at %.0f "
+                            "cm (target: %.0f cm, %s)",
+                            current_cm,
+                            target_cm,
+                            self._state_snapshot(),
+                        )
+                        idle_abort = True
+                        break
+                    # After one confirmed idle episode, stop issuing further
+                    # move commands for a short grace period and only observe
+                    # whether the desk resumes on its own. Continuing to send
+                    # UP/DOWN during this window can race with a physical
+                    # panel button press and leave TiMotion firmware stuck in
+                    # an unresponsive state.
+                    self._panel_idle_event.clear()
+                    try:
+                        await asyncio.wait_for(
+                            self._panel_idle_event.wait(),
+                            timeout=MOVEMENT_INTERVAL,
+                        )
+                    except asyncio.TimeoutError:
+                        pass
+                    last_cm = current_cm
+                    continue
+                elif last_idle_count is not None:
                     idle_since_motion = (
                         self._idle_notification_count - last_idle_count
                     )
@@ -529,12 +720,15 @@ class StandUpDeskConnection:
                             _LOGGER.info(
                                 "Panel idle episode confirmed (%d/%d) at "
                                 "%.0f cm; waiting for next episode before "
-                                "aborting (target: %.0f cm)",
+                                "aborting (target: %.0f cm, %s)",
                                 confirmed_idle_abort_episodes,
                                 IDLE_ABORT_CONFIRMED_EPISODES,
                                 current_cm,
                                 target_cm,
+                                self._state_snapshot(),
                             )
+                            waiting_for_motion_after_idle_episode = True
+                            idle_resume_grace_steps = 0
                             last_idle_count = self._idle_notification_count
                             continue
 
@@ -545,11 +739,12 @@ class StandUpDeskConnection:
                             "Panel stop detected: desk went idle %d "
                             "time(s) after starting movement "
                             "(threshold: %d); aborting at "
-                            "%.0f cm (target: %.0f cm)",
+                            "%.0f cm (target: %.0f cm, %s)",
                             idle_since_motion,
                             IDLE_ABORT_MIN_IDLE_NOTIFICATIONS,
                             current_cm,
                             target_cm,
+                            self._state_snapshot(),
                         )
                         idle_abort = True
                         break
@@ -560,10 +755,11 @@ class StandUpDeskConnection:
                     _LOGGER.warning(
                         "Panel stop detected: desk emitted %d idle "
                         "notifications without ever starting motion; "
-                        "aborting at %.0f cm (target: %.0f cm)",
+                        "aborting at %.0f cm (target: %.0f cm, %s)",
                         idled_since_start,
                         current_cm,
                         target_cm,
+                        self._state_snapshot(),
                     )
                     break
 
@@ -634,11 +830,12 @@ class StandUpDeskConnection:
                             _LOGGER.warning(
                                 "Height stuck (%.1f cm progress towards "
                                 "target in 3 s, %d consecutive windows); "
-                                "aborting at %.0f cm (target: %.0f cm)",
+                                "aborting at %.0f cm (target: %.0f cm, %s)",
                                 progress,
                                 low_progress_windows,
                                 current_cm,
                                 target_cm,
+                                self._state_snapshot(),
                             )
                             break
                     else:
@@ -688,9 +885,9 @@ class StandUpDeskConnection:
             # * opposite_dir_abort: desk is executing a panel preset in the
             #   opposite direction — never send STOP (would cancel it).
             # * idle_abort: never send STOP; the panel may be transitioning to
-            #   a preset move. Also do NOT disconnect BLE — calling
-            #   stop_notify/disconnect during an active panel preset locks the
-            #   TiMotion firmware, leaving the panel completely unresponsive.
+            #   a preset move. Also avoid immediate disconnect/stop_notify —
+            #   some TiMotion firmware revisions lock up if HA performs GATT
+            #   operations right after a physical panel interaction.
             # * all other exits: send STOP to cleanly reset firmware state.
             skip_final_stop = opposite_dir_abort or idle_abort
 
@@ -713,14 +910,24 @@ class StandUpDeskConnection:
                 _LOGGER.info("Target reached at %.0f cm", final_cm)
             else:
                 _LOGGER.warning(
-                    "Movement stopped at %.0f cm (target: %.0f cm)",
+                    "Movement stopped at %.0f cm (target: %.0f cm, %s)",
                     final_cm,
                     target_cm,
+                    self._state_snapshot(),
                 )
 
     async def stop(self) -> None:
         """Stop desk movement."""
         self._stop_requested = True
+        cooldown_remaining = self._panel_handoff_cooldown_until - monotonic()
+        if cooldown_remaining > 0:
+            _LOGGER.info(
+                "Stop requested during panel-handoff cooldown (%.1f s remaining);"
+                " STOP frame suppressed (%s)",
+                cooldown_remaining,
+                self._state_snapshot(),
+            )
+            return
         if await self.ensure_connected() and self.client:
             await self.client.write_gatt_char(
                 RX_CHAR_UUID,
