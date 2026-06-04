@@ -114,6 +114,12 @@ automation:
 
 ## Changelog
 
+### 1.0.37
+
+- Rolled back desk movement routine to the stable `v.1.0.2` behavior profile.
+- Reintroduced the simple stall-based move loop to prioritize continuous upward movement.
+- Adjusted regression tests to match rollback behavior.
+
 ### 1.0.36
 
 - Removed startup STOP ping before upward movement to avoid brief pauses.

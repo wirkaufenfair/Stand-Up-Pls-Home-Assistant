@@ -34,9 +34,7 @@ from .const import (
     MANUFACTURER,
     MAX_MOVEMENT_STEPS,
     MAX_STALL_STEPS,
-    HEIGHT_PROGRESS_MIN_CM,
     MODEL,
-    STARTUP_GRACE_STEPS,
     MOVEMENT_INTERVAL,
     RX_CHAR_UUID,
     STOP_COMMAND,
@@ -454,10 +452,7 @@ class StandUpDeskConnection:
                 return
 
             if not await self.ensure_connected() or not self.client:
-                _LOGGER.error(
-                    "Cannot move: not connected (%s)",
-                    self._state_snapshot(),
-                )
+                _LOGGER.error("Cannot move: not connected")
                 return
 
             current_cm = self.current_status.get("height_cm", 0)
@@ -476,30 +471,18 @@ class StandUpDeskConnection:
 
             cmd = UP_COMMAND if direction == "up" else DOWN_COMMAND
 
-            # No startup STOP ping here: a STOP frame at movement start can
-            # create a visible brief pause during upward movement. The desk
-            # should begin moving continuously without an injected stop.
+            # Init ping
+            await self.client.write_gatt_char(
+                RX_CHAR_UUID,
+                STOP_COMMAND,
+                response=False,
+            )
+            await asyncio.sleep(0.3)
 
             self._stop_requested = False
             start_cm = self.current_status.get("height_cm", 0)
             last_cm = start_cm
             stalled_steps = 0
-            startup_grace_steps = STARTUP_GRACE_STEPS
-            last_notif_count = self._notification_count
-            # Height-progress checkpoint: abort if the desk hasn't moved
-            # meaningfully towards the target in the last 3 s (15 steps).
-            # This catches the tug-of-war where HA keeps re-issuing move
-            # commands after a physical panel stop and the desk briefly
-            # restarts, generating is_moving=True notifications that
-            # prevent the notification-count stall counter from latching.
-            height_checkpoint = start_cm
-            height_check_step = 0
-            low_progress_windows = 0
-            up_slow_progress_grace_used = 0
-            moving_updates_in_window = 0
-            # External panel-interrupt heuristics are intentionally disabled.
-            # Reason: on affected desks they can false-trigger and cause
-            # repeated short stops during upward automation.
             _LOGGER.info(
                 "Moving %s: %.0f cm -> %.0f cm",
                 direction,
@@ -536,154 +519,29 @@ class StandUpDeskConnection:
                     target_reached = True
                     break
 
-                received_update = self._notification_count != last_notif_count
-                last_notif_count = self._notification_count
-                if (
-                    received_update
-                    and is_moving
-                    and current_direction == direction
+                has_progress = abs(current_cm - last_cm) >= 0.1
+                if has_progress or (
+                    is_moving and current_direction == direction
                 ):
-                    moving_updates_in_window += 1
-                # Stall detection: only fire when the desk is completely
-                # silent — no BLE notification arrived this step.  As long
-                # as the desk sends any packet the stall counter is cleared.
-                if startup_grace_steps > 0 and not received_update:
-                    startup_grace_steps -= 1
-                    # Start progress windows only once we receive updates.
-                    height_checkpoint = current_cm
-                    height_check_step = 0
-                elif received_update:
-                    startup_grace_steps = 0
                     stalled_steps = 0
                 else:
                     stalled_steps += 1
                     if stalled_steps >= MAX_STALL_STEPS:
                         _LOGGER.warning(
                             "Movement aborted after %d stalled updates at "
-                            "%.0f cm (target: %.0f cm, %s)",
+                            "%.0f cm (target: %.0f cm)",
                             stalled_steps,
                             current_cm,
                             target_cm,
-                            self._state_snapshot(),
                         )
                         break
 
-                # Height-progress check (every 15 steps ≈ 3 s).
-                # The grace period keeps resetting height_checkpoint on
-                # every silent step, so this window only starts measuring
-                # from the moment the desk first communicates.
-                # Threshold: 2.0 cm — catches slow tug-of-war (0.1 cm/step
-                # × 15 steps = 1.5 cm) while allowing normal TiMotion
-                # movement (≥ 2.5 cm/s × 3 s = 7.5 cm).
-                # Some desks climb slowly for the first few seconds while
-                # lifting under load, so allow one low-progress UP window as
-                # long as there is still measurable forward progress.
-                height_check_step += 1
-                if height_check_step >= 15:
-                    progress = (
-                        current_cm - height_checkpoint
-                        if direction == "up"
-                        else height_checkpoint - current_cm
-                    )
-                    if progress < HEIGHT_PROGRESS_MIN_CM:
-                        if (
-                            direction == "up"
-                            and progress > 0
-                            and moving_updates_in_window
-                            >= UP_STEADY_PROGRESS_MIN_MOVING_UPDATES
-                        ):
-                            _LOGGER.info(
-                                "Slow but steady upward progress accepted: "
-                                "%.1f cm towards target in 3 s with %d "
-                                "moving updates at %.0f cm (target: %.0f cm)",
-                                progress,
-                                moving_updates_in_window,
-                                current_cm,
-                                target_cm,
-                            )
-                            low_progress_windows = 0
-                            height_checkpoint = current_cm
-                            height_check_step = 0
-                            moving_updates_in_window = 0
-                            continue
-                        if (
-                            direction == "up"
-                            and progress > 0
-                            and up_slow_progress_grace_used
-                            < UP_SLOW_PROGRESS_GRACE_WINDOWS
-                        ):
-                            up_slow_progress_grace_used += 1
-                            _LOGGER.info(
-                                "Slow upward progress tolerated (%d/%d): "
-                                "%.1f cm towards target in 3 s at %.0f cm "
-                                "(target: %.0f cm)",
-                                up_slow_progress_grace_used,
-                                UP_SLOW_PROGRESS_GRACE_WINDOWS,
-                                progress,
-                                current_cm,
-                                target_cm,
-                            )
-                            height_checkpoint = current_cm
-                            height_check_step = 0
-                            moving_updates_in_window = 0
-                            continue
-                        low_progress_windows += 1
-                        if (
-                            low_progress_windows
-                            >= HEIGHT_PROGRESS_FAIL_WINDOWS
-                        ):
-                            _LOGGER.warning(
-                                "Height stuck (%.1f cm progress towards "
-                                "target in 3 s, %d consecutive windows); "
-                                "aborting at %.0f cm (target: %.0f cm, %s)",
-                                progress,
-                                low_progress_windows,
-                                current_cm,
-                                target_cm,
-                                self._state_snapshot(),
-                            )
-                            break
-                    else:
-                        low_progress_windows = 0
-                    height_checkpoint = current_cm
-                    height_check_step = 0
-                    moving_updates_in_window = 0
-
-                # While the desk reports active motion in the requested
-                # direction AND we keep receiving fresh notifications,
-                # avoid repeated UP/DOWN writes to minimize collision risk
-                # with near-simultaneous panel button actions.
-                #
-                # If notifications go silent, send a fallback move command
-                # to avoid stalling indefinitely on firmwares that require
-                # occasional reinforcement writes.
-                should_send_move_cmd = not (
-                    is_moving
-                    and current_direction == direction
-                    and received_update
+                await self.client.write_gatt_char(
+                    RX_CHAR_UUID,
+                    cmd,
+                    response=False,
                 )
-
-                if should_send_move_cmd:
-                    await self.client.write_gatt_char(
-                        RX_CHAR_UUID,
-                        cmd,
-                        response=False,
-                    )
-                # Responsive sleep: wake up early when an idle packet
-                # arrives so we can release BLE within one BLE
-                # notification round-trip (~5–30 ms) rather than
-                # waiting the full MOVEMENT_INTERVAL (200 ms). Fast
-                # release is critical: TiMotion firmware can lock the
-                # physical panel if BLE stays open too long after the
-                # user presses a panel button during HA movement.
-                self._panel_idle_event.clear()
-                try:
-                    await asyncio.wait_for(
-                        self._panel_idle_event.wait(),
-                        timeout=MOVEMENT_INTERVAL,
-                    )
-                except asyncio.TimeoutError:
-                    pass
+                await asyncio.sleep(MOVEMENT_INTERVAL)
                 last_cm = current_cm
 
             # Always send a final STOP to leave firmware in a clean state.
@@ -700,10 +558,9 @@ class StandUpDeskConnection:
                 _LOGGER.info("Target reached at %.0f cm", final_cm)
             else:
                 _LOGGER.warning(
-                    "Movement stopped at %.0f cm (target: %.0f cm, %s)",
+                    "Movement stopped at %.0f cm (target: %.0f cm)",
                     final_cm,
                     target_cm,
-                    self._state_snapshot(),
                 )
 
     async def stop(self) -> None:
