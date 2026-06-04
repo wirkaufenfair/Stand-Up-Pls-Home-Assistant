@@ -1,3 +1,4 @@
+# pylint: disable=too-many-lines
 """Stand Up Pls Desk integration for Home Assistant.
 
 Controls TiMotion TWD1 Bluetooth sit-stand desks via BLE (Nordic UART Service).
@@ -140,22 +141,18 @@ class StandUpDeskConnection:
             self._panel_handoff_disconnect_task is not None
             and not self._panel_handoff_disconnect_task.done()
         )
+        height = float(status.get("height_cm", 0.0))
+        direction = status.get("direction", "unknown")
+        moving = status.get("is_moving", False)
         return (
-            "height={height:.1f} direction={direction} moving={moving} "
-            "connected={connected} stop_requested={stop_requested} "
-            "notif={notif} idle_notif={idle_notif} moving_notif={moving_notif} "
-            "cooldown={cooldown:.2f}s delayed_disconnect={disconnect_pending}"
-        ).format(
-            height=float(status.get("height_cm", 0.0)),
-            direction=status.get("direction", "unknown"),
-            moving=status.get("is_moving", False),
-            connected=self.is_connected,
-            stop_requested=self._stop_requested,
-            notif=self._notification_count,
-            idle_notif=self._idle_notification_count,
-            moving_notif=self._moving_notification_count,
-            cooldown=cooldown_remaining,
-            disconnect_pending=disconnect_pending,
+            f"height={height:.1f} direction={direction} moving={moving} "
+            f"connected={self.is_connected} "
+            f"stop_requested={self._stop_requested} "
+            f"notif={self._notification_count} "
+            f"idle_notif={self._idle_notification_count} "
+            f"moving_notif={self._moving_notification_count} "
+            f"cooldown={cooldown_remaining:.2f}s "
+            f"delayed_disconnect={disconnect_pending}"
         )
 
     async def connect(self) -> bool:
@@ -201,7 +198,8 @@ class StandUpDeskConnection:
                 and not self._panel_handoff_disconnect_task.done()
             ):
                 _LOGGER.debug(
-                    "Cancelling stale panel-handoff disconnect after reconnect "
+                    "Cancelling stale panel-handoff disconnect "
+                    "after reconnect "
                     "(%s)",
                     self._state_snapshot(),
                 )
@@ -478,20 +476,15 @@ class StandUpDeskConnection:
 
             cmd = UP_COMMAND if direction == "up" else DOWN_COMMAND
 
-            # Init ping
-            await self.client.write_gatt_char(
-                RX_CHAR_UUID,
-                STOP_COMMAND,
-                response=False,
-            )
-            await asyncio.sleep(0.3)
+            # No startup STOP ping here: a STOP frame at movement start can
+            # create a visible brief pause during upward movement. The desk
+            # should begin moving continuously without an injected stop.
 
             self._stop_requested = False
             start_cm = self.current_status.get("height_cm", 0)
             last_cm = start_cm
             stalled_steps = 0
             startup_grace_steps = STARTUP_GRACE_STEPS
-            opposite_direction_steps = 0
             last_notif_count = self._notification_count
             # Height-progress checkpoint: abort if the desk hasn't moved
             # meaningfully towards the target in the last 3 s (15 steps).
@@ -504,41 +497,9 @@ class StandUpDeskConnection:
             low_progress_windows = 0
             up_slow_progress_grace_used = 0
             moving_updates_in_window = 0
-            # Panel-stop detection has two modes:
-            #   * post-motion: once the desk confirms it has started moving
-            #     (a fresh is_moving=True notification, or current_status
-            #     reporting is_moving=True in the target direction), only
-            #     consider abort after at least 2 idle notifications and then
-            #     run the idle confirmation window.  To reduce false positives
-            #     on desks that briefly pause while moving up under load,
-            #     require two confirmed idle episodes before aborting.
-            #     This avoids false aborts from single transient idle bursts
-            #     observed on some desks.
-            #   * held-stop: if the desk never starts moving at all and only
-            #     emits idle notifications, abort after IDLE_HELD_STOP_LIMIT
-            #     idle notifications.  A higher threshold here avoids false
-            #     aborts during slow motor spin-up where some TiMotion desks
-            #     emit a couple of is_moving=False packets before engaging.
-            last_idle_count: int | None = None
-            confirmed_idle_abort_episodes = 0
-            waiting_for_motion_after_idle_episode = False
-            idle_resume_grace_steps = 0
-            idle_baseline = self._idle_notification_count
-            moving_baseline = self._moving_notification_count
-            idle_held_stop_limit = 5
-            post_idle_episode_silence_steps = 0
-            # Set to True only when the panel is actively executing a preset
-            # move in the *opposite* direction.  In that case the final STOP
-            # must be skipped because the desk is mid-preset and a spurious
-            # BLE STOP would cancel it and leave the TiMotion firmware
-            # confused, making the panel appear unresponsive.
-            # For idle-detection aborts the desk is already stopped, so
-            # sending STOP is safe and necessary to reset firmware state —
-            # unless the desk starts a preset move during the post-loop wait.
-            opposite_dir_abort = False
-            # Set to True when the post-motion idle check triggers the abort.
-            # Used to gate the post-loop preset-detection delay below.
-            idle_abort = False
+            # External panel-interrupt heuristics are intentionally disabled.
+            # Reason: on affected desks they can false-trigger and cause
+            # repeated short stops during upward automation.
             _LOGGER.info(
                 "Moving %s: %.0f cm -> %.0f cm",
                 direction,
@@ -563,30 +524,6 @@ class StandUpDeskConnection:
                 is_moving = self.current_status.get("is_moving", False)
 
                 if (
-                    is_moving
-                    and current_direction in {"up", "down"}
-                    and current_direction != direction
-                ):
-                    # Single observation is enough: is_moving=True with a
-                    # direction opposite to our target is an unambiguous
-                    # sign that the panel (preset button) took over.
-                    # Debouncing here would let HA send another UP command
-                    # in parallel with the panel's preset move, which the
-                    # TiMotion firmware reacts to by locking up the panel.
-                    opposite_direction_steps += 1
-                    _LOGGER.warning(
-                        "Movement override detected: desk reports %s "
-                        "while target direction is %s; stopping loop (%s)",
-                        current_direction,
-                        direction,
-                        self._state_snapshot(),
-                    )
-                    opposite_dir_abort = True
-                    break
-                else:
-                    opposite_direction_steps = 0
-
-                if (
                     direction == "up"
                     and current_cm >= target_cm - TOLERANCE_CM
                 ):
@@ -609,52 +546,18 @@ class StandUpDeskConnection:
                     moving_updates_in_window += 1
                 # Stall detection: only fire when the desk is completely
                 # silent — no BLE notification arrived this step.  As long
-                # as the desk sends *any* packet (is_moving=True, idle, or
-                # error) the stall counter is cleared.  This avoids the
-                # previous false-positive where the 0.2 cm/step threshold
-                # fired during motor acceleration when the desk sends
-                # is_moving=True but hasn't yet reached full speed.
-                # Slow tug-of-war (desk moves 0.1 cm/step with no idle
-                # packet) is handled instead by the height-progress window
-                # below (2.0 cm minimum over 15 steps = 3 s).
+                # as the desk sends any packet the stall counter is cleared.
                 if startup_grace_steps > 0 and not received_update:
-                    # Desk completely silent at startup — give the motor
-                    # time to spin up.  Reset the height-progress window on
-                    # every silent step so it only starts measuring from the
-                    # moment the desk first communicates.
                     startup_grace_steps -= 1
+                    # Start progress windows only once we receive updates.
                     height_checkpoint = current_cm
                     height_check_step = 0
                 elif received_update:
-                    # Desk is communicating — end startup grace and clear
-                    # the stall counter.
                     startup_grace_steps = 0
                     stalled_steps = 0
-                    post_idle_episode_silence_steps = 0
                 else:
-                    # Post-grace silence: desk stopped sending notifications.
-                    if (
-                        confirmed_idle_abort_episodes > 0
-                        and post_idle_episode_silence_steps
-                        < IDLE_ABORT_POST_EPISODE_SILENCE_GRACE_STEPS
-                    ):
-                        post_idle_episode_silence_steps += 1
-                        stalled_steps = 0
-                        continue
                     stalled_steps += 1
                     if stalled_steps >= MAX_STALL_STEPS:
-                        # If we already saw at least one idle notification
-                        # after confirmed motion, this stall can be a delayed
-                        # panel preset handoff (idle first, motion packet
-                        # later). Treat it like idle-abort so we do not send
-                        # a final STOP that could cancel the panel preset.
-                        if (
-                            last_idle_count is not None
-                            and self._idle_notification_count > last_idle_count
-                        ):
-                            idle_abort = True
-                        elif confirmed_idle_abort_episodes > 0:
-                            idle_abort = True
                         _LOGGER.warning(
                             "Movement aborted after %d stalled updates at "
                             "%.0f cm (target: %.0f cm, %s)",
@@ -664,120 +567,6 @@ class StandUpDeskConnection:
                             self._state_snapshot(),
                         )
                         break
-
-                # Panel-stop detection: see comment near the loop start
-                # for the two-mode design.
-                moved_since_start = (
-                    self._moving_notification_count - moving_baseline
-                )
-                idled_since_start = (
-                    self._idle_notification_count - idle_baseline
-                )
-                if last_idle_count is None and (
-                    moved_since_start > 0
-                    or (is_moving and current_direction == direction)
-                ):
-                    last_idle_count = self._idle_notification_count
-                if is_moving and current_direction == direction:
-                    confirmed_idle_abort_episodes = 0
-                    waiting_for_motion_after_idle_episode = False
-                    idle_resume_grace_steps = 0
-                if (
-                    last_idle_count is not None
-                    and waiting_for_motion_after_idle_episode
-                ):
-                    idle_resume_grace_steps += 1
-                    if idle_resume_grace_steps >= IDLE_ABORT_RESUME_GRACE_STEPS:
-                        _LOGGER.info(
-                            "Desk remained idle after one confirmed idle "
-                            "episode; continuing observation and requiring "
-                            "a second confirmed episode before aborting at "
-                            "%.0f cm (target: %.0f cm, %s)",
-                            current_cm,
-                            target_cm,
-                            self._state_snapshot(),
-                        )
-                        waiting_for_motion_after_idle_episode = False
-                        idle_resume_grace_steps = 0
-                        last_idle_count = self._idle_notification_count
-                        continue
-                    # After one confirmed idle episode, stop issuing further
-                    # move commands for a short grace period and only observe
-                    # whether the desk resumes on its own. Continuing to send
-                    # UP/DOWN during this window can race with a physical
-                    # panel button press and leave TiMotion firmware stuck in
-                    # an unresponsive state.
-                    self._panel_idle_event.clear()
-                    try:
-                        await asyncio.wait_for(
-                            self._panel_idle_event.wait(),
-                            timeout=MOVEMENT_INTERVAL,
-                        )
-                    except asyncio.TimeoutError:
-                        pass
-                    last_cm = current_cm
-                    continue
-                elif last_idle_count is not None:
-                    idle_since_motion = (
-                        self._idle_notification_count - last_idle_count
-                    )
-                    if idle_since_motion >= IDLE_ABORT_MIN_IDLE_NOTIFICATIONS:
-                        if not await self._idle_abort_confirmed(direction):
-                            # Transient idle pulse during normal movement.
-                            # Re-arm idle tracking from the latest baseline.
-                            last_idle_count = self._idle_notification_count
-                            continue
-
-                        confirmed_idle_abort_episodes += 1
-                        if (
-                            confirmed_idle_abort_episodes
-                            < IDLE_ABORT_CONFIRMED_EPISODES
-                        ):
-                            _LOGGER.info(
-                                "Panel idle episode confirmed (%d/%d) at "
-                                "%.0f cm; waiting for next episode before "
-                                "aborting (target: %.0f cm, %s)",
-                                confirmed_idle_abort_episodes,
-                                IDLE_ABORT_CONFIRMED_EPISODES,
-                                current_cm,
-                                target_cm,
-                                self._state_snapshot(),
-                            )
-                            waiting_for_motion_after_idle_episode = True
-                            idle_resume_grace_steps = 0
-                            last_idle_count = self._idle_notification_count
-                            continue
-
-                        # Abort once persistent idleness is observed after
-                        # confirmed motion and the confirmation window keeps
-                        # reporting no target-direction movement.
-                        _LOGGER.warning(
-                            "Panel stop detected: desk went idle %d "
-                            "time(s) after starting movement "
-                            "(threshold: %d); aborting at "
-                            "%.0f cm (target: %.0f cm, %s)",
-                            idle_since_motion,
-                            IDLE_ABORT_MIN_IDLE_NOTIFICATIONS,
-                            current_cm,
-                            target_cm,
-                            self._state_snapshot(),
-                        )
-                        idle_abort = True
-                        break
-                elif (
-                    moved_since_start == 0
-                    and idled_since_start >= idle_held_stop_limit
-                ):
-                    _LOGGER.warning(
-                        "Panel stop detected: desk emitted %d idle "
-                        "notifications without ever starting motion; "
-                        "aborting at %.0f cm (target: %.0f cm, %s)",
-                        idled_since_start,
-                        current_cm,
-                        target_cm,
-                        self._state_snapshot(),
-                    )
-                    break
 
                 # Height-progress check (every 15 steps ≈ 3 s).
                 # The grace period keeps resetting height_checkpoint on
@@ -897,47 +686,14 @@ class StandUpDeskConnection:
                     pass
                 last_cm = current_cm
 
-            # Decide whether to send a final STOP.
-            # * opposite_dir_abort: desk is executing a panel preset in the
-            #   opposite direction — never send STOP (would cancel it).
-            # * idle_abort: never send STOP; the panel may be transitioning to
-            #   a preset move. Also avoid immediate disconnect/stop_notify —
-            #   some TiMotion firmware revisions lock up if HA performs GATT
-            #   operations right after a physical panel interaction.
-            # * all other exits: send STOP to cleanly reset firmware state.
-            if (
-                not target_reached
-                and not opposite_dir_abort
-                and not idle_abort
-                and confirmed_idle_abort_episodes > 0
-                and self.current_status.get("direction", "idle") == "idle"
-                and not self.current_status.get("is_moving", False)
-            ):
-                _LOGGER.warning(
-                    "Panel stop detected: desk remained idle after confirmed "
-                    "idle episode(s); treating as panel handoff at %.0f cm "
-                    "(target: %.0f cm, %s)",
-                    self.current_status.get("height_cm", last_cm),
-                    target_cm,
-                    self._state_snapshot(),
-                )
-                idle_abort = True
-
-            skip_final_stop = opposite_dir_abort or idle_abort
-
-            if not skip_final_stop and self.client and self.is_connected:
+            # Always send a final STOP to leave firmware in a clean state.
+            if self.client and self.is_connected:
                 await self.client.write_gatt_char(
                     RX_CHAR_UUID,
                     STOP_COMMAND,
                     response=False,
                 )
                 await asyncio.sleep(0.1)
-
-            # Panel-interrupt exits should release BLE promptly so the panel
-            # can regain control immediately. The release path intentionally
-            # disconnects without stop_notify to avoid TiMotion lockups.
-            if opposite_dir_abort or idle_abort:
-                await self._release_ble_control_after_panel_interrupt()
 
             final_cm = self.current_status.get("height_cm", last_cm)
             if target_reached:
@@ -956,7 +712,8 @@ class StandUpDeskConnection:
         cooldown_remaining = self._panel_handoff_cooldown_until - monotonic()
         if cooldown_remaining > 0:
             _LOGGER.info(
-                "Stop requested during panel-handoff cooldown (%.1f s remaining);"
+                "Stop requested during panel-handoff cooldown "
+                "(%.1f s remaining);"
                 " STOP frame suppressed (%s)",
                 cooldown_remaining,
                 self._state_snapshot(),

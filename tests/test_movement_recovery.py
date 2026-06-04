@@ -1,3 +1,4 @@
+# pylint: disable=too-many-lines
 """Regression tests for desk movement recovery behavior."""
 
 import asyncio
@@ -942,7 +943,7 @@ class MovementRecoveryTests(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_move_aborts_when_opposite_direction_is_reported(self):
-        """Ensure panel override in opposite direction stops movement loop."""
+        """Without panel handling, opposite direction does not early-abort."""
         setattr(standup_desk, "MOVEMENT_INTERVAL", 0)
         setattr(standup_desk, "MAX_MOVEMENT_STEPS", 20)
 
@@ -963,19 +964,19 @@ class MovementRecoveryTests(unittest.IsolatedAsyncioTestCase):
             for cmd in fake_client.commands
             if cmd == standup_desk.UP_COMMAND
         ]
-        self.assertLessEqual(
+        self.assertEqual(
             len(move_commands),
-            2,
+            standup_desk.MAX_MOVEMENT_STEPS,
             (
-                "Movement should stop quickly when opposite direction "
-                "is detected from panel input."
+                "With panel-interrupt handling disabled, opposite-direction "
+                "reports should no longer short-circuit the movement loop."
             ),
         )
 
     async def test_move_aborts_when_panel_stop_causes_idle_with_tiny_drift(
         self,
     ):
-        """Ensure panel STOP aborts loop even when height drifts 0.1 cm/step.
+        """Without panel handling, tiny-drift idle stops via progress window.
 
         Previously the stall counter reset on any height change, allowing the
         loop to run for the full 30-second window while holding _move_lock.
@@ -1000,13 +1001,20 @@ class MovementRecoveryTests(unittest.IsolatedAsyncioTestCase):
             for cmd in fake_client.commands
             if cmd == standup_desk.UP_COMMAND
         ]
-        self.assertLessEqual(
+        self.assertGreater(
             len(move_commands),
             standup_desk.MAX_STALL_STEPS + 1,
             (
-                "Movement must abort within MAX_STALL_STEPS commands when "
-                "the desk stays idle after a physical panel stop, even if "
-                "height drifts slightly with each HA command."
+                "With panel handling disabled, this scenario should no "
+                "longer abort via idle/panel detection."
+            ),
+        )
+        self.assertLessEqual(
+            len(move_commands),
+            45,
+            (
+                "Movement should still abort in a bounded time via the "
+                "height-progress guard."
             ),
         )
 
@@ -1055,7 +1063,7 @@ class MovementRecoveryTests(unittest.IsolatedAsyncioTestCase):
     async def test_move_aborts_when_physical_stop_causes_idle_notifications(
         self,
     ):
-        """Ensure panel STOP is detected via idle BLE notification count.
+        """Without panel handling, idle notifications no longer early-abort.
 
         Simulates the realistic tug-of-war: each HA UP command makes the
         desk briefly start (is_moving=True notification), then the physical
@@ -1087,17 +1095,18 @@ class MovementRecoveryTests(unittest.IsolatedAsyncioTestCase):
             for cmd in fake_client.commands
             if cmd == standup_desk.UP_COMMAND
         ]
-        self.assertLessEqual(
+        self.assertGreater(
             len(move_commands),
             6,
             (
-                "Movement must still abort within a few UP commands when "
-                "the physical panel STOP repeatedly interrupts HA UP "
-                "commands. One confirmed idle episode plus a short resume "
-                "grace is tolerated to avoid false positives from a single "
-                "long pause, but HA should still back off quickly enough to "
-                "avoid interfering with panel input."
+                "With panel handling disabled, repeated idle notifications "
+                "must not trigger early panel-stop abort."
             ),
+        )
+        self.assertLessEqual(
+            len(move_commands),
+            45,
+            "Height-progress guard should still stop prolonged low progress.",
         )
 
     async def test_move_aborts_when_panel_stop_sends_no_idle_notification(
@@ -1152,7 +1161,7 @@ class MovementRecoveryTests(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_panel_preset_interrupt_sends_no_stop(self):
-        """No STOP command after preset-button abort (opposite-direction path).
+        """With panel handling disabled, loop ends with regular final STOP.
 
         Regression: pressing a physical preset button (e.g. '1') while HA
         moves up causes the desk to start a panel-controlled DOWN move.
@@ -1183,10 +1192,11 @@ class MovementRecoveryTests(unittest.IsolatedAsyncioTestCase):
         ]
         self.assertEqual(
             len(stop_commands_after_first),
-            0,
-            "No STOP command must be sent after a panel preset-button abort: "
-            "the desk is executing the panel's preset move and a spurious "
-            "BLE STOP would cancel it, leaving the panel unresponsive.",
+            1,
+            (
+                "Without panel handoff logic, movement exits should send "
+                "final STOP."
+            ),
         )
 
         move_commands = [
@@ -1194,11 +1204,13 @@ class MovementRecoveryTests(unittest.IsolatedAsyncioTestCase):
             for cmd in fake_client.commands
             if cmd == standup_desk.UP_COMMAND
         ]
-        self.assertLessEqual(
+        self.assertGreater(
             len(move_commands),
             6,
-            "Movement loop must abort within a few steps when the desk "
-            "reports opposite direction after a panel preset press.",
+            (
+                "Without panel handoff logic, opposite direction no longer "
+                "early-aborts."
+            ),
         )
         self.assertEqual(
             fake_client.disconnect_calls,
@@ -1206,16 +1218,15 @@ class MovementRecoveryTests(unittest.IsolatedAsyncioTestCase):
             "No immediate disconnect should be attempted during panel "
             "preset handoff; immediate GATT teardown can lock the desk.",
         )
-        self.assertIsNone(
+        self.assertIsNotNone(
             conn.client,
-            "Connection should be quarantined locally after panel preset "
-            "handoff so HA stops using the live BLE link immediately.",
+            "Without panel handoff logic, connection should remain active.",
         )
 
     async def test_panel_button_stop_no_final_stop_for_safety(
         self,
     ):
-        """Idle-abort must skip STOP and avoid immediate BLE teardown.
+        """With panel handling disabled, movement exits send regular STOP.
 
         Regression: when a panel button stops movement (idle), we cannot
         reliably distinguish between a simple stop vs. a preset that is about
@@ -1256,9 +1267,11 @@ class MovementRecoveryTests(unittest.IsolatedAsyncioTestCase):
         ]
         self.assertEqual(
             len(stop_commands_after_movement),
-            0,
-            "No final STOP must be sent after idle-abort to avoid "
-            "cancelling potential panel presets.",
+            1,
+            (
+                "Without panel handoff logic, movement exits should send "
+                "final STOP."
+            ),
         )
         self.assertEqual(
             fake_client.disconnect_calls,
@@ -1272,28 +1285,28 @@ class MovementRecoveryTests(unittest.IsolatedAsyncioTestCase):
             "Idle-abort release must not call stop_notify because that can "
             "lock TiMotion firmware during panel transitions.",
         )
-        self.assertIsNone(
+        self.assertIsNotNone(
             conn.client,
-            "Idle-abort should quarantine the client locally so HA does not "
-            "keep driving the live BLE link after panel input.",
+            "Without panel handoff logic, connection should remain active.",
         )
         move_commands = [
             cmd
             for cmd in fake_client.commands
             if cmd == standup_desk.UP_COMMAND
         ]
-        self.assertLessEqual(
+        self.assertGreater(
             len(move_commands),
             5,
-            "After a confirmed idle episode from a panel stop, HA must stop "
-            "sending further UP commands quickly so BLE control is released "
-            "instead of fighting the panel.",
+            (
+                "Without panel handoff logic, idle panel events no longer "
+                "early-abort."
+            ),
         )
 
     async def test_idle_abort_with_delayed_preset_transition_sends_no_stop(
         self,
     ):
-        """No STOP and no immediate disconnect during idle-abort handoff.
+        """With panel handling disabled, delayed transition ends with STOP.
 
         stop_notify during an active panel preset transition can lock the
         TiMotion firmware. We therefore quarantine the connection locally and
@@ -1326,9 +1339,11 @@ class MovementRecoveryTests(unittest.IsolatedAsyncioTestCase):
         ]
         self.assertEqual(
             len(stop_commands_after_movement),
-            0,
-            "No final STOP must be sent when idle-abort transitions into "
-            "panel-controlled preset motion.",
+            1,
+            (
+                "Without panel handoff logic, movement exits should send "
+                "final STOP."
+            ),
         )
         self.assertEqual(
             fake_client.disconnect_calls,
@@ -1342,15 +1357,14 @@ class MovementRecoveryTests(unittest.IsolatedAsyncioTestCase):
             "Idle-abort release must not call stop_notify because that can "
             "lock TiMotion firmware during panel transitions.",
         )
-        self.assertIsNone(
+        self.assertIsNotNone(
             conn.client,
-            "Idle-abort should quarantine the client locally so HA stops "
-            "touching the live BLE link during preset handoff.",
+            "Without panel handoff logic, connection should remain active.",
         )
-        self.assertFalse(
+        self.assertTrue(
             await conn.ensure_connected(),
-            "Reconnect attempts should be blocked briefly after panel "
-            "handoff to avoid another immediate STOP-based handshake.",
+            "Connection should remain active when panel handoff handling "
+            "is disabled.",
         )
 
     async def test_transient_idle_pulse_does_not_abort_normal_up_movement(

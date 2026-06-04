@@ -114,6 +114,12 @@ automation:
 
 ## Changelog
 
+### 1.0.36
+
+- Removed startup STOP ping before upward movement to avoid brief pauses.
+- Disabled panel/external interrupt handoff heuristics for more continuous upward runs.
+- Refined movement diagnostics formatting and updated regression tests.
+
 ### 1.0.35
 
 - Improved movement stability for upward runs when a single idle episode occurs during load.
